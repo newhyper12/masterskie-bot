@@ -1,10 +1,10 @@
 # handlers/admin.py
-# Админ-панель: создание мастерских, расписание записи, напоминания,
-# фото приветствия.
+# Админ-панель v2: создание (с двумя датами), расписание, редактирование,
+# удаление с бэкапом и удалением файла, восстановление, фото, напоминания.
 
 from __future__ import annotations
 
-import os
+import json
 from datetime import datetime
 
 from aiogram import F, Router
@@ -13,20 +13,25 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from attendance import AttendanceClient
-from config import Settings, update_env_value
+from config import Settings
+from db import DB
 from keyboards import (
     kb_admin_audience,
+    kb_admin_edit_fields,
     kb_admin_format,
     kb_admin_menu,
     kb_admin_no_close,
     kb_admin_open_now,
     kb_admin_skip,
     kb_admin_workshops,
+    kb_confirm_delete,
+    kb_confirm_restore,
+    kb_format_photo_pick,
 )
 from models import Workshop
-from records_client import RecordsClient
-from sheets_client import SheetsClient
+from scheduler import Scheduler
 from states import (
+    AdminEditStates,
     AdminReminderStates,
     AdminScheduleStates,
     AdminServiceStates,
@@ -34,7 +39,8 @@ from states import (
 )
 from texts import (
     ADMIN_ASK_CLOSE_AT,
-    ADMIN_ASK_DATE,
+    ADMIN_ASK_DATE1,
+    ADMIN_ASK_DATE2,
     ADMIN_ASK_DAYS,
     ADMIN_ASK_DESCRIPTION,
     ADMIN_ASK_FORMAT,
@@ -45,16 +51,39 @@ from texts import (
     ADMIN_ASK_QUOTA,
     ADMIN_ASK_REMINDER_TEXT,
     ADMIN_ASK_SET_PHOTO,
+    ADMIN_ASK_START_TEXT,
     ADMIN_ASK_TITLE,
     ADMIN_MENU_TEXT,
     ADMIN_PHOTO_SET,
     ADMIN_SCHEDULE_SAVED,
     ADMIN_WORKSHOP_CREATED,
+    DELETE_CONFIRM,
+    DELETE_DONE,
+    DELETE_PICK,
+    EDIT_ASK_PHOTO,
+    EDIT_ASK_VALUE,
+    EDIT_DONE,
+    EDIT_PICK,
+    FORMAT_PHOTO_PICK,
+    FORMAT_PHOTO_SET,
     REMINDER_SENT,
+    RESTORE_DONE,
+    RESTORE_NONE,
+    RESTORE_PICK,
+    START_TEXT_SET,
     reminder_text,
 )
 
 router = Router()
+
+EDIT_LABELS = {
+    "title": "название",
+    "description": "описание",
+    "date1": "дата 1",
+    "date2": "дата 2",
+    "location": "место",
+    "quota": "квота",
+}
 
 
 def _is_admin(user_id: int, settings: Settings) -> bool:
@@ -69,7 +98,7 @@ def _parse_dt(value: str) -> datetime | None:
 
 
 # ==================================================
-# ВХОД В ПАНЕЛЬ
+# ВХОД
 # ==================================================
 
 @router.message(Command("admin"))
@@ -88,13 +117,11 @@ async def cb_admin_menu(callback: CallbackQuery, settings: Settings):
 
 
 # ==================================================
-# МАСТЕР СОЗДАНИЯ МАСТЕРСКОЙ
+# СОЗДАНИЕ МАСТЕРСКОЙ
 # ==================================================
 
 @router.callback_query(F.data == "admin:create")
-async def cb_admin_create(
-    callback: CallbackQuery, state: FSMContext, settings: Settings
-):
+async def cb_admin_create(callback: CallbackQuery, state: FSMContext, settings: Settings):
     if not _is_admin(callback.from_user.id, settings):
         return
     await callback.answer()
@@ -114,7 +141,7 @@ async def st_title(message: Message, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith("awfmt:"), AdminWorkshopStates.format)
-async def cb_admin_format(callback: CallbackQuery, state: FSMContext):
+async def cb_format(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.update_data(format=callback.data.split(":", 1)[1])
     await state.set_state(AdminWorkshopStates.description)
@@ -124,13 +151,29 @@ async def cb_admin_format(callback: CallbackQuery, state: FSMContext):
 @router.message(AdminWorkshopStates.description)
 async def st_description(message: Message, state: FSMContext):
     await state.update_data(description=(message.text or "").strip())
-    await state.set_state(AdminWorkshopStates.date)
-    await message.answer(ADMIN_ASK_DATE)
+    await state.set_state(AdminWorkshopStates.date1)
+    await message.answer(ADMIN_ASK_DATE1)
 
 
-@router.message(AdminWorkshopStates.date)
-async def st_date(message: Message, state: FSMContext):
-    await state.update_data(date=(message.text or "").strip())
+@router.message(AdminWorkshopStates.date1)
+async def st_date1(message: Message, state: FSMContext):
+    await state.update_data(date1=(message.text or "").strip())
+    data = await state.get_data()
+    if data.get("format") == "базовая":
+        await state.set_state(AdminWorkshopStates.date2)
+        await message.answer(ADMIN_ASK_DATE2)
+    else:
+        await state.update_data(date2="")
+        await state.set_state(AdminWorkshopStates.location)
+        await message.answer(ADMIN_ASK_LOCATION)
+
+
+@router.message(AdminWorkshopStates.date2)
+async def st_date2(message: Message, state: FSMContext):
+    value = (message.text or "").strip()
+    if value.lower() in ("нет", "-", "не"):
+        value = ""
+    await state.update_data(date2=value)
     await state.set_state(AdminWorkshopStates.location)
     await message.answer(ADMIN_ASK_LOCATION)
 
@@ -179,17 +222,14 @@ async def st_quota(message: Message, state: FSMContext):
 
 @router.message(AdminWorkshopStates.photo, F.photo)
 async def st_photo(message: Message, state: FSMContext):
-    photo = message.photo[-1]
-    await state.update_data(photo=photo.file_id)
+    await state.update_data(photo=message.photo[-1].file_id)
     await state.set_state(AdminWorkshopStates.open_at)
     await message.answer(ADMIN_ASK_OPEN_AT, reply_markup=kb_admin_open_now())
 
 
 @router.message(AdminWorkshopStates.photo)
 async def st_photo_fallback(message: Message):
-    await message.answer(
-        "Пришли фото картинкой (не файлом) или нажми «Пропустить»."
-    )
+    await message.answer("Пришли фото картинкой или нажми «Пропустить».")
 
 
 @router.callback_query(F.data == "skip:photo", AdminWorkshopStates.photo)
@@ -197,20 +237,14 @@ async def cb_skip_photo(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.update_data(photo="")
     await state.set_state(AdminWorkshopStates.open_at)
-    await callback.message.answer(
-        ADMIN_ASK_OPEN_AT, reply_markup=kb_admin_open_now()
-    )
+    await callback.message.answer(ADMIN_ASK_OPEN_AT, reply_markup=kb_admin_open_now())
 
-
-# ---------- время открытия ----------
 
 @router.message(AdminWorkshopStates.open_at)
 async def st_open_at(message: Message, state: FSMContext):
     dt = _parse_dt(message.text or "")
     if dt is None:
-        await message.answer(
-            "Не понял дату. Формат: ДД.ММ.ГГГГ ЧЧ:ММ, например 15.05.2026 16:00"
-        )
+        await message.answer("Формат: ДД.ММ.ГГГГ ЧЧ:ММ, или «⚡ Открыть сразу».")
         return
     await state.update_data(open_at_iso=dt.strftime("%Y-%m-%d %H:%M"))
     await state.set_state(AdminWorkshopStates.close_at)
@@ -221,117 +255,109 @@ async def st_open_at(message: Message, state: FSMContext):
 async def cb_open_now(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.update_data(
-        open_at_iso=datetime.now().strftime("%Y-%m-%d %H:%M"),
-        is_open=True,
+        open_at_iso=datetime.now().strftime("%Y-%m-%d %H:%M"), is_open=True
     )
     await state.set_state(AdminWorkshopStates.close_at)
-    await callback.message.answer(
-        ADMIN_ASK_CLOSE_AT, reply_markup=kb_admin_no_close()
-    )
+    await callback.message.answer(ADMIN_ASK_CLOSE_AT, reply_markup=kb_admin_no_close())
 
-
-# ---------- время закрытия ----------
 
 @router.message(AdminWorkshopStates.close_at)
 async def st_close_at(
-    message: Message,
-    state: FSMContext,
-    sheets: SheetsClient,
-    attendance: AttendanceClient,
+    message: Message, state: FSMContext, db: DB, attendance: AttendanceClient
 ):
     dt = _parse_dt(message.text or "")
     if dt is None:
-        await message.answer(
-            "Не понял дату. Формат: ДД.ММ.ГГГГ ЧЧ:ММ, "
-            "или нажми «Не закрывать»."
-        )
+        await message.answer("Формат: ДД.ММ.ГГГГ ЧЧ:ММ, или «Не закрывать».")
         return
     await state.update_data(close_at_iso=dt.strftime("%Y-%m-%d %H:%M"))
-    await _finish_create(message, state, sheets, attendance)
+    await _finish_create(message, state, db, attendance)
 
 
 @router.callback_query(F.data == "noclose", AdminWorkshopStates.close_at)
 async def cb_no_close(
-    callback: CallbackQuery,
-    state: FSMContext,
-    sheets: SheetsClient,
-    attendance: AttendanceClient,
+    callback: CallbackQuery, state: FSMContext, db: DB, attendance: AttendanceClient
 ):
     await callback.answer()
     await state.update_data(close_at_iso="")
-    await _finish_create(callback.message, state, sheets, attendance)
+    await _finish_create(callback.message, state, db, attendance)
 
 
-async def _finish_create(
-    obj: Message,
-    state: FSMContext,
-    sheets: SheetsClient,
-    attendance: AttendanceClient,
-):
+async def _finish_create(obj: Message, state: FSMContext, db: DB, attendance: AttendanceClient):
     data = await state.get_data()
+    now = datetime.now()
 
-    workshop_id = await sheets.get_next_workshop_id()
+    open_iso = data.get("open_at_iso", "")
+    close_iso = data.get("close_at_iso", "")
+    is_open = data.get("is_open", False)
+    if not is_open and open_iso:
+        try:
+            is_open = datetime.fromisoformat(open_iso) <= now
+        except ValueError:
+            pass
+    if is_open and close_iso:
+        try:
+            if datetime.fromisoformat(close_iso) <= now:
+                is_open = False
+        except ValueError:
+            pass
+
     workshop = Workshop(
-        id=workshop_id,
+        id=db.next_workshop_id(),
         title=data.get("title", ""),
         format=data.get("format", "базовая"),
         description=data.get("description", ""),
-        date=data.get("date", ""),
+        date1=data.get("date1", ""),
+        date2=data.get("date2", ""),
         location=data.get("location", ""),
         lessons_count=data.get("lessons", 1),
         days=data.get("days", ""),
         quota=data.get("quota", 0),
         photo=data.get("photo", ""),
-        open_date=data.get("open_at_iso", ""),
-        close_date=data.get("close_at_iso", ""),
-        is_open=data.get("is_open", False),
+        open_date=open_iso,
+        close_date=close_iso,
+        is_open=is_open,
         attendance_file_id=None,
     )
 
     try:
-        file_id = await attendance.create(workshop)
+        workshop.attendance_file_id = await attendance.create(workshop)
     except Exception as e:
         await state.clear()
         await obj.answer(
-            "⚠️ Не получилось создать файл посещаемости.\n"
-            "Освободи место на Диске или обнови токен: "
-            "python3 refresh_google_token.py"
+            "⚠️ Не получилось создать файл посещаемости. "
+            "Обнови токен: python3 refresh_google_token.py"
         )
         await obj.answer(f"Детали: {str(e)[:200]}")
         await obj.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
         return
 
-    workshop.attendance_file_id = file_id
-    await sheets.create_workshop(workshop)
+    db.create_workshop(workshop)
     await state.clear()
 
-    open_human = "сейчас" if workshop.is_open else (workshop.open_date or "—")
-    close_human = workshop.close_date or "не закрывается"
     await obj.answer(
-        ADMIN_WORKSHOP_CREATED.format(title=workshop.title, open_at=open_human)
+        ADMIN_WORKSHOP_CREATED.format(
+            title=workshop.title, open_at=open_iso or "сейчас"
+        )
     )
-    await obj.answer(f"🔒 Запись закроется: {close_human}")
     await obj.answer(
-        "📄 Файл посещаемости (отправь преподавателю и оператору):\n"
-        f"https://docs.google.com/spreadsheets/d/{file_id}"
+        "📄 Файл посещаемости (отправь преподавателю):\n"
+        f"https://docs.google.com/spreadsheets/d/{workshop.attendance_file_id}"
     )
     await obj.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
 
 
 # ==================================================
-# РАСПИСАНИЕ ЗАПИСИ (открытие/закрытие по датам)
+# РАСПИСАНИЕ ЗАПИСИ
 # ==================================================
 
 @router.callback_query(F.data == "admin:toggle")
-async def cb_admin_toggle(
-    callback: CallbackQuery, sheets: SheetsClient, settings: Settings
-):
+async def cb_admin_toggle(callback: CallbackQuery, db: DB, settings: Settings):
     if not _is_admin(callback.from_user.id, settings):
         return
     await callback.answer()
-    workshops = await sheets.get_workshops()
+    workshops = db.get_workshops()
     await callback.message.answer(
-        "Выбери мастерскую — зададим время открытия и закрытия записи:",
+        "Выбери мастерскую — зададим время открытия и закрытия:",
         reply_markup=kb_admin_workshops(workshops, "sched"),
     )
 
@@ -341,19 +367,14 @@ async def cb_sched_ws(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(AdminScheduleStates.open_at)
     await state.update_data(sched_ws=int(callback.data.split(":")[1]))
-    await callback.message.answer(
-        ADMIN_ASK_OPEN_AT, reply_markup=kb_admin_open_now()
-    )
+    await callback.message.answer(ADMIN_ASK_OPEN_AT, reply_markup=kb_admin_open_now())
 
 
 @router.message(AdminScheduleStates.open_at)
 async def st_sched_open(message: Message, state: FSMContext):
     dt = _parse_dt(message.text or "")
     if dt is None:
-        await message.answer(
-            "Не понял дату. Формат: ДД.ММ.ГГГГ ЧЧ:ММ, "
-            "или нажми «Открыть сразу»."
-        )
+        await message.answer("Формат: ДД.ММ.ГГГГ ЧЧ:ММ, или «⚡ Открыть сразу».")
         return
     await state.update_data(sched_open=dt.strftime("%Y-%m-%d %H:%M"))
     await state.set_state(AdminScheduleStates.close_at)
@@ -363,53 +384,51 @@ async def st_sched_open(message: Message, state: FSMContext):
 @router.callback_query(F.data == "openat:now", AdminScheduleStates.open_at)
 async def cb_sched_open_now(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    await state.update_data(
-        sched_open=datetime.now().strftime("%Y-%m-%d %H:%M")
-    )
+    await state.update_data(sched_open=datetime.now().strftime("%Y-%m-%d %H:%M"))
     await state.set_state(AdminScheduleStates.close_at)
-    await callback.message.answer(
-        ADMIN_ASK_CLOSE_AT, reply_markup=kb_admin_no_close()
-    )
+    await callback.message.answer(ADMIN_ASK_CLOSE_AT, reply_markup=kb_admin_no_close())
 
 
 @router.message(AdminScheduleStates.close_at)
-async def st_sched_close(
-    message: Message, state: FSMContext, sheets: SheetsClient
-):
+async def st_sched_close(message: Message, state: FSMContext, db: DB):
     dt = _parse_dt(message.text or "")
     if dt is None:
-        await message.answer(
-            "Не понял дату. Формат: ДД.ММ.ГГГГ ЧЧ:ММ, "
-            "или нажми «Не закрывать»."
-        )
+        await message.answer("Формат: ДД.ММ.ГГГГ ЧЧ:ММ, или «Не закрывать».")
         return
-    await _finish_schedule(
-        message, state, sheets, dt.strftime("%Y-%m-%d %H:%M")
-    )
+    await _finish_schedule(message, state, db, dt.strftime("%Y-%m-%d %H:%M"))
 
 
 @router.callback_query(F.data == "noclose", AdminScheduleStates.close_at)
-async def cb_sched_no_close(
-    callback: CallbackQuery, state: FSMContext, sheets: SheetsClient
-):
+async def cb_sched_no_close(callback: CallbackQuery, state: FSMContext, db: DB):
     await callback.answer()
-    await _finish_schedule(callback.message, state, sheets, "")
+    await _finish_schedule(callback.message, state, db, "")
 
 
-async def _finish_schedule(
-    obj: Message, state: FSMContext, sheets: SheetsClient, close_iso: str
-):
+async def _finish_schedule(obj: Message, state: FSMContext, db: DB, close_iso: str):
     data = await state.get_data()
     ws_id = data.get("sched_ws")
     open_iso = data.get("sched_open", "")
 
-    await sheets.set_schedule(ws_id, open_iso, close_iso)
+    now = datetime.now()
+    is_open = False
+    if open_iso:
+        try:
+            is_open = datetime.fromisoformat(open_iso) <= now
+        except ValueError:
+            pass
+    if is_open and close_iso:
+        try:
+            if datetime.fromisoformat(close_iso) <= now:
+                is_open = False
+        except ValueError:
+            pass
+
+    db.update_workshop(ws_id, open_date=open_iso, close_date=close_iso, is_open=is_open)
     await state.clear()
 
-    workshop = await sheets.get_workshop_by_id(ws_id)
-    title = workshop.title if workshop else f"№{ws_id}"
+    w = db.get_workshop(ws_id)
     await obj.answer(
-        f"«{title}»: "
+        f"«{w.title if w else ws_id}»: "
         + ADMIN_SCHEDULE_SAVED.format(
             open_at=open_iso or "—", close_at=close_iso or "не закрывается"
         )
@@ -418,13 +437,230 @@ async def _finish_schedule(
 
 
 # ==================================================
-# ФОТО ПРИВЕТСТВИЯ
+# РЕДАКТИРОВАНИЕ
 # ==================================================
 
-@router.callback_query(F.data == "admin:setphoto")
-async def cb_admin_setphoto(
-    callback: CallbackQuery, state: FSMContext, settings: Settings
+@router.callback_query(F.data == "admin:edit")
+async def cb_admin_edit(callback: CallbackQuery, db: DB, settings: Settings):
+    if not _is_admin(callback.from_user.id, settings):
+        return
+    await callback.answer()
+    workshops = db.get_workshops()
+    await callback.message.answer(
+        "Какую мастерскую редактируем?",
+        reply_markup=kb_admin_workshops(workshops, "editws"),
+    )
+
+
+@router.callback_query(F.data.startswith("editws:"))
+async def cb_editws(callback: CallbackQuery, state: FSMContext, db: DB):
+    await callback.answer()
+    ws_id = int(callback.data.split(":")[1])
+    await state.update_data(edit_ws=ws_id)
+    w = db.get_workshop(ws_id)
+    await callback.message.answer(
+        EDIT_PICK.format(title=w.title if w else ws_id),
+        reply_markup=kb_admin_edit_fields(ws_id),
+    )
+
+
+@router.callback_query(F.data.startswith("editf:"))
+async def cb_editf(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    _, field, ws_raw = callback.data.split(":")
+    ws_id = int(ws_raw)
+    await state.update_data(edit_ws=ws_id, edit_field=field)
+    if field == "photo":
+        await state.set_state(AdminEditStates.photo)
+        await callback.message.answer(EDIT_ASK_PHOTO)
+    else:
+        await state.set_state(AdminEditStates.value)
+        await callback.message.answer(
+            EDIT_ASK_VALUE.format(field=EDIT_LABELS.get(field, field))
+        )
+
+
+@router.message(AdminEditStates.value)
+async def st_edit_value(message: Message, state: FSMContext, db: DB):
+    data = await state.get_data()
+    field = data.get("edit_field", "title")
+    ws_id = data.get("edit_ws")
+    value = (message.text or "").strip()
+
+    if field == "quota":
+        if not value.isdigit() or int(value) < 1:
+            await message.answer("Нужно положительное число.")
+            return
+        db.update_workshop(ws_id, quota=int(value))
+    elif field == "date2":
+        if value.lower() in ("нет", "-", "не"):
+            value = ""
+        db.update_workshop(ws_id, date2=value)
+    else:
+        db.update_workshop(ws_id, **{field: value})
+
+    await state.clear()
+    await message.answer(EDIT_DONE)
+    w = db.get_workshop(ws_id)
+    await message.answer(
+        EDIT_PICK.format(title=w.title if w else ws_id),
+        reply_markup=kb_admin_edit_fields(ws_id),
+    )
+
+
+@router.message(AdminEditStates.photo, F.photo)
+async def st_edit_photo(message: Message, state: FSMContext, db: DB):
+    data = await state.get_data()
+    ws_id = data.get("edit_ws")
+    db.update_workshop(ws_id, photo=message.photo[-1].file_id)
+    await state.clear()
+    await message.answer(EDIT_DONE)
+    w = db.get_workshop(ws_id)
+    await message.answer(
+        EDIT_PICK.format(title=w.title if w else ws_id),
+        reply_markup=kb_admin_edit_fields(ws_id),
+    )
+
+
+# ==================================================
+# УДАЛЕНИЕ И ВОССТАНОВЛЕНИЕ
+# ==================================================
+
+@router.callback_query(F.data == "admin:delete")
+async def cb_admin_delete(callback: CallbackQuery, db: DB, settings: Settings):
+    if not _is_admin(callback.from_user.id, settings):
+        return
+    await callback.answer()
+    workshops = db.get_workshops()
+    await callback.message.answer(
+        DELETE_PICK, reply_markup=kb_admin_workshops(workshops, "del")
+    )
+
+
+@router.callback_query(F.data.startswith("del:"))
+async def cb_del(
+    callback: CallbackQuery,
+    db: DB,
+    attendance: AttendanceClient,
+    scheduler: Scheduler,
 ):
+    await callback.answer()
+    _, action, ws_raw = callback.data.split(":")
+    ws_id = int(ws_raw)
+    w = db.get_workshop(ws_id)
+    if not w:
+        return
+
+    if action == "no":
+        await callback.message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
+        return
+
+    # Свежий бэкап перед удалением.
+    try:
+        await scheduler.backup_one(ws_id)
+    except Exception as e:
+        print(f"[backup] ошибка перед удалением: {e}")
+
+    # Удаляем файл с Диска.
+    if w.attendance_file_id:
+        try:
+            await attendance.delete_file(w.attendance_file_id)
+        except Exception as e:
+            print(f"[drive] не удалось удалить файл: {e}")
+
+    db.update_workshop(ws_id, deleted=True, is_open=False)
+    await callback.message.answer(DELETE_DONE.format(title=w.title))
+    await callback.message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
+
+
+@router.callback_query(F.data == "admin:restore")
+async def cb_admin_restore(callback: CallbackQuery, db: DB, settings: Settings):
+    if not _is_admin(callback.from_user.id, settings):
+        return
+    await callback.answer()
+    deleted = [
+        w for w in db.get_workshops_raw(include_deleted=True)
+        if w.deleted and db.has_backups(w.id)
+    ]
+    if not deleted:
+        await callback.message.answer(RESTORE_NONE)
+        return
+    await callback.message.answer(
+        RESTORE_PICK, reply_markup=kb_admin_workshops(deleted, "rest")
+    )
+
+
+@router.callback_query(F.data.startswith("rest:"))
+async def cb_rest(
+    callback: CallbackQuery, db: DB, attendance: AttendanceClient
+):
+    await callback.answer()
+    _, action, ws_raw = callback.data.split(":")
+    ws_id = int(ws_raw)
+    w = db.get_workshop(ws_id)
+    if not w:
+        return
+
+    if action == "no":
+        await callback.message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
+        return
+
+    backup = db.latest_backup(ws_id)
+    new_file_id = None
+    if backup and backup.get("attendance"):
+        try:
+            new_file_id = await attendance.restore(
+                f"{w.title} — посещаемость", backup["attendance"]
+            )
+        except Exception as e:
+            print(f"[restore] не удалось восстановить файл: {e}")
+    if not new_file_id:
+        try:
+            new_file_id = await attendance.create(w)
+        except Exception as e:
+            print(f"[restore] не удалось создать файл: {e}")
+
+    db.update_workshop(ws_id, deleted=False, attendance_file_id=new_file_id)
+    await callback.message.answer(RESTORE_DONE.format(title=w.title))
+    if new_file_id:
+        await callback.message.answer(
+            "📄 Новый файл посещаемости:\n"
+            f"https://docs.google.com/spreadsheets/d/{new_file_id}"
+        )
+    await callback.message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
+
+
+# ==================================================
+# ФОТО ФОРМАТОВ / ПРИВЕТСТВИЯ / ТЕКСТ ПРИВЕТСТВИЯ
+# ==================================================
+
+@router.callback_query(F.data == "admin:fmtphoto")
+async def cb_admin_fmtphoto(callback: CallbackQuery, state: FSMContext, settings: Settings):
+    if not _is_admin(callback.from_user.id, settings):
+        return
+    await callback.answer()
+    await callback.message.answer(FORMAT_PHOTO_PICK, reply_markup=kb_format_photo_pick())
+
+
+@router.callback_query(F.data.startswith("fmtphoto:"))
+async def cb_fmtphoto_format(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.update_data(fmt_name=callback.data.split(":", 1)[1])
+    await state.set_state(AdminServiceStates.format_photo)
+    await callback.message.answer("Пришли фото для этого формата.")
+
+
+@router.message(AdminServiceStates.format_photo, F.photo)
+async def st_format_photo(message: Message, state: FSMContext, db: DB):
+    data = await state.get_data()
+    name = data.get("fmt_name", "базовая")
+    db.set_format_photo(name, message.photo[-1].file_id)
+    await state.clear()
+    await message.answer(FORMAT_PHOTO_SET.format(name=name))
+
+
+@router.callback_query(F.data == "admin:setphoto")
+async def cb_admin_setphoto(callback: CallbackQuery, state: FSMContext, settings: Settings):
     if not _is_admin(callback.from_user.id, settings):
         return
     await callback.answer()
@@ -433,26 +669,51 @@ async def cb_admin_setphoto(
 
 
 @router.message(AdminServiceStates.start_photo, F.photo)
-async def st_setphoto(message: Message, state: FSMContext):
-    photo = message.photo[-1]
-    update_env_value("START_PHOTO_ID", photo.file_id)
-    os.environ["START_PHOTO_ID"] = photo.file_id
+async def st_setphoto(message: Message, state: FSMContext, db: DB):
+    db.kv_set("START_PHOTO_ID", message.photo[-1].file_id)
     await state.clear()
     await message.answer(ADMIN_PHOTO_SET)
 
 
-# ==================================================
-# НАПОМИНАНИЯ УЧАСТНИКАМ
-# ==================================================
-
-@router.callback_query(F.data == "admin:remind")
-async def cb_admin_remind(
-    callback: CallbackQuery, sheets: SheetsClient, settings: Settings
-):
+@router.callback_query(F.data == "admin:settext")
+async def cb_admin_settext(callback: CallbackQuery, state: FSMContext, settings: Settings):
     if not _is_admin(callback.from_user.id, settings):
         return
     await callback.answer()
-    workshops = await sheets.get_workshops()
+    await state.set_state(AdminServiceStates.start_text)
+    await callback.message.answer(ADMIN_ASK_START_TEXT)
+
+
+@router.message(AdminServiceStates.start_text)
+async def st_settext(message: Message, state: FSMContext, db: DB):
+    """
+    Сохраняем текст ВМЕСТЕ с entities — так премиум-эмодзи,
+    вставленные тобой, сохраняются и отображаются у пользователей.
+    """
+    keep = []
+    for e in (message.entities or []):
+        if e.type in ("custom_emoji", "bold", "italic", "underline"):
+            d = {"type": e.type, "offset": e.offset, "length": e.length}
+            if e.type == "custom_emoji":
+                d["custom_emoji_id"] = e.custom_emoji_id
+            keep.append(d)
+    db.kv_set("START_MESSAGE", json.dumps(
+        {"text": message.text or "", "entities": keep}, ensure_ascii=False
+    ))
+    await state.clear()
+    await message.answer(START_TEXT_SET)
+
+
+# ==================================================
+# НАПОМИНАНИЯ
+# ==================================================
+
+@router.callback_query(F.data == "admin:remind")
+async def cb_admin_remind(callback: CallbackQuery, db: DB, settings: Settings):
+    if not _is_admin(callback.from_user.id, settings):
+        return
+    await callback.answer()
+    workshops = db.get_workshops()
     await callback.message.answer(
         "По какой мастерской напомнить?",
         reply_markup=kb_admin_workshops(workshops, "remindws"),
@@ -464,9 +725,7 @@ async def cb_remind_ws(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(AdminReminderStates.audience)
     await state.update_data(remind_ws=int(callback.data.split(":")[1]))
-    await callback.message.answer(
-        "Кому отправить?", reply_markup=kb_admin_audience()
-    )
+    await callback.message.answer("Кому отправить?", reply_markup=kb_admin_audience())
 
 
 @router.callback_query(F.data.startswith("aud:"), AdminReminderStates.audience)
@@ -478,19 +737,14 @@ async def cb_audience(callback: CallbackQuery, state: FSMContext):
 
 
 @router.message(AdminReminderStates.text)
-async def st_reminder_text(
-    message: Message,
-    state: FSMContext,
-    sheets: SheetsClient,
-    records: RecordsClient,
-):
+async def st_reminder_text(message: Message, state: FSMContext, db: DB):
     data = await state.get_data()
     ws_id = data.get("remind_ws")
     audience = data.get("audience", "все")
     body = (message.text or "").strip()
 
-    workshop = await sheets.get_workshop_by_id(ws_id)
-    if not workshop:
+    w = db.get_workshop(ws_id)
+    if not w:
         await state.clear()
         await message.answer("Мастерская не найдена.")
         return
@@ -502,15 +756,11 @@ async def st_reminder_text(
     else:
         statuses = ["основной", "резерв"]
 
-    targets = await records.get_workshop_records(ws_id, statuses)
-
     sent = 0
-    for rec in targets:
+    for rec in db.get_workshop_records(ws_id, statuses):
         try:
             await message.bot.send_message(
-                rec.telegram_id,
-                reminder_text(workshop.title, body),
-                parse_mode="HTML",
+                rec.telegram_id, reminder_text(w.title, body), parse_mode="HTML"
             )
             sent += 1
         except Exception:
@@ -522,16 +772,13 @@ async def st_reminder_text(
 
 
 # ==================================================
-# УТИЛИТА: file_id для любого фото от админа (вне состояний)
+# УТИЛИТА: file_id для фото вне состояний
 # ==================================================
 
 @router.message(F.photo)
 async def photo_file_id_utility(message: Message, settings: Settings):
-    """
-    Если админ шлёт фото вне мастеров — бот отвечает file_id.
-    Удобно для заполнения листа «Форматы».
-    """
     if not _is_admin(message.from_user.id, settings):
         return
-    photo = message.photo[-1]
-    await message.answer(f"file_id этого фото:\n<code>{photo.file_id}</code>")
+    await message.answer(
+        f"file_id этого фото:\n<code>{message.photo[-1].file_id}</code>"
+    )

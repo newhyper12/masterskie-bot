@@ -1,11 +1,10 @@
 # states.py
-# Состояния диалогов бота.
+# Состояния диалогов бота, версия 2.
 
 from aiogram.fsm.state import State, StatesGroup
 
 
 class SurveyStates(StatesGroup):
-    """Анкета пользователя при первом запуске."""
     consent = State()
     full_name = State()
     group = State()
@@ -22,7 +21,8 @@ class AdminWorkshopStates(StatesGroup):
     title = State()
     format = State()
     description = State()
-    date = State()
+    date1 = State()
+    date2 = State()
     location = State()
     lessons = State()
     days = State()
@@ -33,18 +33,22 @@ class AdminWorkshopStates(StatesGroup):
 
 
 class AdminScheduleStates(StatesGroup):
-    """Ручная настройка расписания открытия/закрытия записи."""
     open_at = State()
     close_at = State()
 
 
+class AdminEditStates(StatesGroup):
+    """Редактирование мастерской: ждём новое значение поля."""
+    value = State()
+    photo = State()
+
+
 class AdminServiceStates(StatesGroup):
-    """Служебные админ-действия (фото приветствия и т.п.)."""
     start_photo = State()
+    format_photo = State()
+    start_text = State()
 
 
 class AdminReminderStates(StatesGroup):
-    """Рассылка напоминания участникам."""
-    workshop = State()
     audience = State()
     text = State()

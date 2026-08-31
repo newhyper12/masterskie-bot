@@ -1,127 +1,121 @@
 # handlers/start.py
-# /start, главное меню, согласие на обработку персональных данных.
+# /start одним сообщением + входы в воронки.
 
 from __future__ import annotations
 
-import os
+import json
 
 from aiogram import F, Router
-from aiogram.filters import CommandStart
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, MessageEntity
 
+from db import DB
 from keyboards import kb_consent, kb_start
-from records_client import RecordsClient
-from sheets_client import SheetsClient
 from states import SurveyStates
-from texts import ASK_FULL_NAME, CONSENT_TEXT, START_TEXT
+from texts import CONSENT_TEXT, START_TEXT
 
 router = Router()
 
 
-async def route_after(
-    obj, after: str, sheets: SheetsClient, records: RecordsClient, user_id: int
-):
-    """
-    Куда вести пользователя после того, как профиль готов.
-    """
-    if after == "my":
-        from handlers.workshop import show_my_records
-        await show_my_records(obj, user_id, sheets, records)
-    else:
-        from handlers.workshop import show_formats
-        await show_formats(obj, sheets)
-
-
-async def require_profile(
-    callback: CallbackQuery,
-    state: FSMContext,
-    sheets: SheetsClient,
-    records: RecordsClient,
-    after: str,
-):
-    """
-    Если профиль уже заполнен — сразу ведём дальше.
-    Если нет — показываем согласие 152-ФЗ и начинаем анкету.
-    """
-    await callback.answer()
-
-    profile = await sheets.get_profile(callback.from_user.id)
-    if profile:
-        await route_after(
-            callback.message, after, sheets, records, callback.from_user.id
-        )
-        return
-
-    await state.set_state(SurveyStates.consent)
-    await state.update_data(after=after)
-    await callback.message.answer(CONSENT_TEXT, reply_markup=kb_consent())
-
-
-@router.message(CommandStart())
-async def cmd_start(message: Message):
-    """Стартовое сообщение с информацией о проекте."""
-    # Если в .env есть START_PHOTO_ID — отправим с фото.
-    # Это должен быть file_id из Telegram (см. инструкцию ниже).
-    photo_id = os.getenv("START_PHOTO_ID", "").strip()
-    if photo_id:
+async def _send_start(message: Message, db: DB):
+    """Одно приветственное сообщение с inline-меню."""
+    stored = db.kv_get("START_MESSAGE")
+    if stored:
         try:
-            await message.answer_photo(
-                photo_id,
-                caption=START_TEXT,
-                reply_markup=kb_start(),
-                parse_mode="HTML",
-            )
+            data = json.loads(stored)
+            ents = [
+                MessageEntity(
+                    type=e["type"], offset=e["offset"], length=e["length"],
+                    custom_emoji_id=e.get("custom_emoji_id"),
+                )
+                for e in data.get("entities", [])
+                if e["type"] in ("custom_emoji", "bold", "italic", "underline")
+            ]
+            await message.answer(data["text"], entities=ents, reply_markup=kb_start())
             return
         except Exception:
             pass
 
-    await message.answer(START_TEXT, reply_markup=kb_start(), parse_mode="HTML")
+    photo = db.kv_get("START_PHOTO_ID")
+    if photo:
+        try:
+            await message.answer_photo(photo, caption=START_TEXT, reply_markup=kb_start())
+            return
+        except Exception:
+            pass
+    await message.answer(START_TEXT, reply_markup=kb_start())
 
+
+@router.message(Command("start"))
+async def cmd_start(message: Message, db: DB):
+    await _send_start(message, db)
+
+
+# ==================================================
+# ТЕКСТОВЫЕ КНОПКИ (если у кого-то осталась нижняя клавиатура)
+# ==================================================
+
+@router.message(F.text == "📝 Регистрация на МК")
+async def msg_register(message: Message, state: FSMContext, db: DB):
+    await require_profile_msg(message, "register", state, db)
+
+
+@router.message(F.text == "📋 Мои записи")
+async def msg_my(message: Message, state: FSMContext, db: DB):
+    await require_profile_msg(message, "my", state, db)
+
+
+@router.message(F.text == "🏠 Меню")
+async def msg_old_menu(message: Message, db: DB):
+    await _send_start(message, db)
+
+
+async def require_profile_msg(message: Message, after: str, state: FSMContext, db: DB):
+    profile = db.get_profile(message.from_user.id)
+    if profile:
+        await route_after(message, after, db, message.from_user.id)
+        return
+    await state.update_data(after=after)
+    await state.set_state(SurveyStates.consent)
+    await message.answer(CONSENT_TEXT, reply_markup=kb_consent())
+
+
+# ==================================================
+# INLINE-ВХОДЫ
+# ==================================================
 
 @router.callback_query(F.data == "menu:register")
-async def cb_register(
-    callback: CallbackQuery,
-    state: FSMContext,
-    sheets: SheetsClient,
-    records: RecordsClient,
-):
-    """Кнопка «📝 Регистрация на МК»."""
-    await require_profile(callback, state, sheets, records, after="register")
+async def cb_register(callback: CallbackQuery, state: FSMContext, db: DB):
+    await require_profile(callback, "register", state, db)
 
 
 @router.callback_query(F.data == "menu:my")
-async def cb_my(
-    callback: CallbackQuery,
-    state: FSMContext,
-    sheets: SheetsClient,
-    records: RecordsClient,
-):
-    """Кнопка «📋 Мои записи»."""
-    await require_profile(callback, state, sheets, records, after="my")
-
-
-@router.callback_query(F.data == "consent:yes", SurveyStates.consent)
-async def cb_consent(callback: CallbackQuery, state: FSMContext):
-    """
-    Единственная кнопка согласия.
-    Без неё анкета просто не начнётся.
-    """
-    await callback.answer()
-
-    from datetime import datetime
-    await state.update_data(
-        consent_date=datetime.now().strftime("%Y-%m-%d %H:%M")
-    )
-    await state.set_state(SurveyStates.full_name)
-    await callback.message.answer(ASK_FULL_NAME)
+async def cb_my(callback: CallbackQuery, state: FSMContext, db: DB):
+    await require_profile(callback, "my", state, db)
 
 
 @router.callback_query(F.data == "back:menu")
-async def cb_back_menu(callback: CallbackQuery, state: FSMContext):
-    """Возврат в главное меню."""
+async def cb_back_menu(callback: CallbackQuery, db: DB):
     await callback.answer()
-    await state.clear()
-    await callback.message.answer(
-        START_TEXT, reply_markup=kb_start(), parse_mode="HTML"
-    )
+    await _send_start(callback.message, db)
+
+
+async def require_profile(callback: CallbackQuery, after: str, state: FSMContext, db: DB):
+    await callback.answer()
+    profile = db.get_profile(callback.from_user.id)
+    if profile:
+        await route_after(callback.message, after, db, callback.from_user.id)
+        return
+    await state.update_data(after=after)
+    await state.set_state(SurveyStates.consent)
+    await callback.message.answer(CONSENT_TEXT, reply_markup=kb_consent())
+
+
+async def route_after(obj, after: str, db: DB, user_id: int):
+    if after == "my":
+        from handlers.workshop import show_my_records
+        await show_my_records(obj, user_id, db)
+    else:
+        from handlers.workshop import show_formats
+        await show_formats(obj, db)

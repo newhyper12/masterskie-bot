@@ -6,3 +6,8 @@ oauth_token.json
 __pycache__/
 *.pyc
 .DS_Store
+
+# база с данными — не в репозиторий!
+bot.db
+bot.db-wal
+bot.db-shm

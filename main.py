@@ -1,73 +1,59 @@
 # main.py
-# main.py
-# Точка входа: собирает бота, клиентов и фоновый монитор.
-
-from __future__ import annotations
+# Точка входа, версия 2: SQLite + фоновый планировщик.
 
 import asyncio
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.enums import ParseMode
 
 from attendance import AttendanceClient
 from config import load_settings
-from drive_client import DriveClient
+from db import DB
+from export import ExportClient
 from handlers import admin, start, survey, workshop
-from records_client import RecordsClient
-from sheets_client import SheetsClient
-from status_monitor import StatusMonitor
+from migrate import migrate_if_needed
+from scheduler import Scheduler
 
 
 async def main():
-    settings = load_settings(require_bot_token=True)
+    settings = load_settings()
 
-    # Бот с дефолтным parse_mode=HTML, чтобы не указывать его всюду.
+    db = DB("bot.db")
+    attendance = AttendanceClient(settings)
+    export = ExportClient(settings, db)
+    scheduler = Scheduler(settings, db, attendance, export)
+
     bot = Bot(
         token=settings.bot_token,
-        default=DefaultBotProperties(parse_mode="HTML"),
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    dp = Dispatcher()
 
-    dp = Dispatcher(storage=MemoryStorage())
-
-    # Клиенты для работы с Google.
-    sheets = SheetsClient(settings)
-    records = RecordsClient(settings)
-    drive = DriveClient(settings)
-    attendance = AttendanceClient(settings)
-
-    # Фоновый монитор правок оператора.
-    monitor = StatusMonitor(settings, sheets, records, attendance)
-
-    # Когда бот сам меняет статусы, монитор узнаёт об этом сразу
-    # и не считает это правкой оператора.
-    records.on_known = monitor.set_known
-
-    # Прокидываем объекты во все хендлеры.
-    dp.workflow_data.update(
-        settings=settings,
-        sheets=sheets,
-        records=records,
-        drive=drive,
-        attendance=attendance,
-        monitor=monitor,
-    )
-
-    # Регистрируем роутеры. Порядок важен: start -> survey -> workshop -> admin.
     dp.include_router(start.router)
     dp.include_router(survey.router)
     dp.include_router(workshop.router)
     dp.include_router(admin.router)
 
+    dp.workflow_data.update(
+        settings=settings,
+        db=db,
+        attendance=attendance,
+        export=export,
+        scheduler=scheduler,
+    )
+
     async def on_startup():
-        monitor.bot = bot
-        await sheets.ensure_workshop_columns()
-        await sheets.refresh()
-        await records.refresh()
-        asyncio.create_task(monitor.run())
-        print("Бот запущен. Кэш прогрет, монитор работает.")
+        scheduler.bot = bot
+        await migrate_if_needed(settings, db)
+        asyncio.create_task(scheduler.run())
+        print("Бот запущен (v2, SQLite). Планировщик работает.")
+
+    async def on_shutdown():
+        await bot.session.close()
 
     dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
 
     await dp.start_polling(bot)
 

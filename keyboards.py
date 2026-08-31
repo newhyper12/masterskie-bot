@@ -1,5 +1,5 @@
 # keyboards.py
-# Все клавиатуры бота: inline-кнопки воронок и постоянная нижняя клавиатура.
+# Все клавиатуры бота, версия 2.
 
 from aiogram.types import InlineKeyboardButton as KB
 from aiogram.types import InlineKeyboardMarkup as Markup
@@ -9,11 +9,10 @@ from models import Workshop
 
 
 # ==================================================
-# ПОЛЬЗОВАТЕЛЬСКИЕ КЛАВИАТУРЫ
+# ПОЛЬЗОВАТЕЛЬСКИЕ
 # ==================================================
 
 def kb_start() -> Markup:
-    """Главное меню пользователя."""
     return Markup(inline_keyboard=[
         [KB(text="📝 Регистрация на МК", callback_data="menu:register")],
         [KB(text="📋 Мои записи", callback_data="menu:my")],
@@ -21,10 +20,6 @@ def kb_start() -> Markup:
 
 
 def kb_main_reply() -> ReplyKeyboardMarkup:
-    """
-    Постоянная нижняя клавиатура.
-    Живёт под полем ввода всегда, чтобы пользователь никогда не терялся.
-    """
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="🏠 Меню")]],
         resize_keyboard=True,
@@ -32,7 +27,6 @@ def kb_main_reply() -> ReplyKeyboardMarkup:
 
 
 def kb_consent() -> Markup:
-    # Кнопки «Не согласен» нет: без согласия анкета просто не сохраняется.
     return Markup(inline_keyboard=[
         [KB(text="✅ Согласен", callback_data="consent:yes")],
     ])
@@ -64,7 +58,6 @@ def kb_edit_fields() -> Markup:
 
 
 def kb_formats() -> Markup:
-    """Фиксированный выбор формата (не зависит от таблицы)."""
     return Markup(inline_keyboard=[
         [KB(text="Базовые", callback_data="fmt:базовая")],
         [KB(text="Специальные", callback_data="fmt:специальная")],
@@ -73,33 +66,35 @@ def kb_formats() -> Markup:
 
 
 def kb_workshops(workshops: list[Workshop]) -> Markup:
-    """Список мастерских выбранного формата."""
     rows = [[KB(text=w.title, callback_data=f"ws:{w.id}")] for w in workshops]
     rows.append([KB(text="↩️ Назад", callback_data="back:formats")])
     return Markup(inline_keyboard=rows)
 
 
 def kb_workshop_card(workshop_id: int) -> Markup:
-    """Карточка мастерской."""
     return Markup(inline_keyboard=[
         [KB(text="✅ Записаться", callback_data=f"signup:{workshop_id}")],
         [KB(text="↩️ Назад", callback_data="back:workshops")],
     ])
 
 
-def kb_reserve(workshop_id: int) -> Markup:
-    """Вопрос «Хотите в резерв?»."""
+def kb_slot_dates(workshop_id: int, date1: str, date2: str) -> Markup:
+    """Выбор даты для базовой мастерской."""
     return Markup(inline_keyboard=[
-        [KB(text="Да", callback_data=f"reserve:yes:{workshop_id}"),
-         KB(text="Нет", callback_data=f"reserve:no:{workshop_id}")],
+        [KB(text=f"📅 {date1}", callback_data=f"slot:1:{workshop_id}")],
+        [KB(text=f"📅 {date2}", callback_data=f"slot:2:{workshop_id}")],
+        [KB(text="↩️ Назад", callback_data=f"ws:{workshop_id}")],
+    ])
+
+
+def kb_reserve(workshop_id: int, slot: int) -> Markup:
+    return Markup(inline_keyboard=[
+        [KB(text="Да", callback_data=f"reserve:yes:{workshop_id}:{slot}"),
+         KB(text="Нет", callback_data=f"reserve:no:{workshop_id}:{slot}")],
     ])
 
 
 def kb_my_records(records: list[tuple[int, str, str]]) -> Markup:
-    """
-    «Мои записи» с кнопками отмены.
-    records: список кортежей (workshop_id, title, status).
-    """
     rows = []
     for ws_id, title, status in records:
         rows.append([
@@ -110,7 +105,6 @@ def kb_my_records(records: list[tuple[int, str, str]]) -> Markup:
 
 
 def kb_cancel_confirm(workshop_id: int) -> Markup:
-    """Подтверждение отмены записи."""
     return Markup(inline_keyboard=[
         [KB(text="Да, отменить", callback_data=f"cancel:yes:{workshop_id}"),
          KB(text="Нет", callback_data=f"cancel:no:{workshop_id}")],
@@ -118,15 +112,20 @@ def kb_cancel_confirm(workshop_id: int) -> Markup:
 
 
 # ==================================================
-# АДМИНСКИЕ КЛАВИАТУРЫ
+# АДМИНСКИЕ
 # ==================================================
 
 def kb_admin_menu() -> Markup:
     return Markup(inline_keyboard=[
         [KB(text="➕ Создать мастерскую", callback_data="admin:create")],
         [KB(text="⏰ Запись: открытие/закрытие", callback_data="admin:toggle")],
-        [KB(text="📨 Напоминание", callback_data="admin:remind")],
+        [KB(text="✏️ Редактировать", callback_data="admin:edit")],
+        [KB(text="🗑 Удалить", callback_data="admin:delete")],
+        [KB(text="♻️ Восстановить", callback_data="admin:restore")],
+        [KB(text="🖼 Фото форматов", callback_data="admin:fmtphoto")],
         [KB(text="🖼 Фото приветствия", callback_data="admin:setphoto")],
+        [KB(text="📨 Напоминание", callback_data="admin:remind")],
+        [KB(text="💬 Текст приветствия", callback_data="admin:settext")],
     ])
 
 
@@ -156,14 +155,48 @@ def kb_admin_no_close() -> Markup:
 
 
 def kb_admin_workshops(workshops: list[Workshop], prefix: str) -> Markup:
-    """Список мастерских для админ-действий (префикс в callback)."""
     rows = [[KB(text=w.title, callback_data=f"{prefix}:{w.id}")] for w in workshops]
     rows.append([KB(text="↩️ Назад", callback_data="admin:menu")])
     return Markup(inline_keyboard=rows)
 
 
+def kb_admin_edit_fields(workshop_id: int) -> Markup:
+    p = f"editf"
+    return Markup(inline_keyboard=[
+        [KB(text="Название", callback_data=f"{p}:title:{workshop_id}")],
+        [KB(text="Описание", callback_data=f"{p}:description:{workshop_id}")],
+        [KB(text="Дата 1", callback_data=f"{p}:date1:{workshop_id}")],
+        [KB(text="Дата 2", callback_data=f"{p}:date2:{workshop_id}")],
+        [KB(text="Место", callback_data=f"{p}:location:{workshop_id}")],
+        [KB(text="Квота", callback_data=f"{p}:quota:{workshop_id}")],
+        [KB(text="Фото", callback_data=f"{p}:photo:{workshop_id}")],
+        [KB(text="↩️ Назад", callback_data="admin:menu")],
+    ])
+
+
+def kb_confirm_delete(workshop_id: int) -> Markup:
+    return Markup(inline_keyboard=[
+        [KB(text="🗑 Да, удалить", callback_data=f"del:yes:{workshop_id}"),
+         KB(text="Нет", callback_data=f"del:no:{workshop_id}")],
+    ])
+
+
+def kb_confirm_restore(workshop_id: int) -> Markup:
+    return Markup(inline_keyboard=[
+        [KB(text="♻️ Да, восстановить", callback_data=f"rest:yes:{workshop_id}"),
+         KB(text="Нет", callback_data=f"rest:no:{workshop_id}")],
+    ])
+
+
+def kb_format_photo_pick() -> Markup:
+    return Markup(inline_keyboard=[
+        [KB(text="Базовые", callback_data="fmtphoto:базовая"),
+         KB(text="Специальные", callback_data="fmtphoto:специальная")],
+        [KB(text="↩️ Назад", callback_data="admin:menu")],
+    ])
+
+
 def kb_admin_audience() -> Markup:
-    """Кому отправить напоминание."""
     return Markup(inline_keyboard=[
         [KB(text="Основной список", callback_data="aud:основной")],
         [KB(text="Резерв", callback_data="aud:резерв")],

@@ -1,6 +1,6 @@
 # handlers/workshop.py
-# Воронка записи: форматы -> мастерские -> карточка -> запись/резерв.
-# Плюс «Мои записи» и отмена записи.
+# Воронка записи версии 2: форматы -> мастерские -> (выбор даты) -> запись.
+# Отмена с автоподъёмом резерва. Всё из БД.
 
 from __future__ import annotations
 
@@ -10,219 +10,228 @@ from aiogram import F, Router
 from aiogram.types import CallbackQuery, InputMediaPhoto, Message
 
 from attendance import AttendanceClient
+from db import DB
 from keyboards import (
     kb_cancel_confirm,
     kb_formats,
     kb_my_records,
     kb_reserve,
+    kb_slot_dates,
     kb_start,
     kb_workshop_card,
     kb_workshops,
 )
 from models import Profile, Record, Workshop
-from records_client import RecordsClient
-from sheets_client import SheetsClient
 from texts import (
     ALREADY_SIGNED,
     ASK_CANCEL,
+    ASK_SLOT,
     CANCEL_DONE,
     CHOOSE_FORMAT,
     CHOOSE_WORKSHOP,
+    GOOGLE_RETRY,
     MY_RECORDS_EMPTY,
     MY_RECORDS_TITLE,
     NO_WORKSHOPS,
+    PROMOTED,
     QUOTA_FULL,
     RESERVE_DONE,
     RESERVE_NO,
     SIGNED_MAIN,
     my_record_line,
     workshop_card_text,
-    GOOGLE_RETRY,
 )
 
 router = Router()
 
 
-# ==================================================
-# СЛУЖЕБНОЕ
-# ==================================================
-
-async def _try_send_photo(
-    message: Message,
-    photo_id: str,
-    text: str,
-    reply_markup=None,
-) -> bool:
-    """
-    Пытается отправить сообщение с фото по file_id.
-    Возвращает True при успехе, False — если не получилось.
-    """
-    if not photo_id:
-        return False
-    try:
-        await message.answer_photo(
-            photo_id,
-            caption=text,
-            reply_markup=reply_markup,
-            parse_mode="HTML",
-        )
-        return True
-    except Exception:
-        return False
+def _slot_date(w: Workshop, slot: int) -> str:
+    if w.format == "базовая":
+        return w.date1 if slot == 1 else (w.date2 or w.date1)
+    return w.date1
 
 
 # ==================================================
-# ПОКАЗ ЭКРАНОВ
+# ЭКРАНЫ
 # ==================================================
 
-async def show_formats(message: Message, sheets: SheetsClient):
-    """
-    Выбор формата: ТОЛЬКО фото (медиагруппа без подписей)
-    + фиксированные кнопки. Никакого текста.
-    """
-    formats = await sheets.get_formats()
-    photos = {f.name: f.photo for f in formats if f.photo}
-
-    media = []
-    for name in ("базовая", "специальная"):
-        if photos.get(name):
-            media.append(InputMediaPhoto(media=photos[name]))
-
+async def show_formats(message: Message, db: DB):
+    formats = db.get_formats()
+    media = [InputMediaPhoto(media=f.photo) for f in formats if f.photo]
     if media:
         await message.answer_media_group(media)
-
     await message.answer(CHOOSE_FORMAT, reply_markup=kb_formats())
 
 
-async def show_workshop_list(
-    message: Message, sheets: SheetsClient, fmt: str
-):
-    """Список открытых мастерских выбранного формата."""
-    workshops = await sheets.get_workshops(format_filter=fmt, only_open=True)
+async def show_workshop_list(message: Message, db: DB, fmt: str):
+    workshops = db.get_workshops(only_open=True, format_filter=fmt)
     if not workshops:
-        formats = await sheets.get_formats()
         await message.answer(NO_WORKSHOPS, reply_markup=kb_formats())
         return
     await message.answer(CHOOSE_WORKSHOP, reply_markup=kb_workshops(workshops))
 
 
-async def show_my_records(
-    message: Message,
-    user_id: int,
-    sheets: SheetsClient,
-    records: RecordsClient,
-):
-    """«Мои записи» с кнопками отмены."""
-    user_records = await records.get_user_records(user_id)
+async def show_my_records(message: Message, user_id: int, db: DB):
+    user_records = db.get_user_records(user_id)
     if not user_records:
         await message.answer(MY_RECORDS_EMPTY, reply_markup=kb_start())
         return
 
-    workshops = await sheets.get_workshops()
-    titles = {w.id: w.title for w in workshops}
-
+    titles = {w.id: w for w in db.get_workshops(include_deleted=True)}
     lines = [MY_RECORDS_TITLE, ""]
     rows = []
     for r in user_records:
-        title = titles.get(r.workshop_id, f"Мастерская №{r.workshop_id}")
+        w = titles.get(r.workshop_id)
+        title = w.title if w else f"Мастерская №{r.workshop_id}"
+        if w and w.format == "базовая":
+            title += f" ({_slot_date(w, r.slot)})"
         lines.append(my_record_line(title, r.status))
         rows.append((r.workshop_id, title, r.status))
 
     await message.answer("\n".join(lines), reply_markup=kb_my_records(rows))
 
 
+# ==================================================
+# ЗАПИСЬ И РЕЗЕРВ
+# ==================================================
+
 async def _do_register(
     message: Message,
     profile: Profile,
     workshop: Workshop,
+    slot: int,
     status: str,
-    records: RecordsClient,
+    db: DB,
     attendance: AttendanceClient,
 ):
-    """
-    Фактическая запись: строка в файл «Записи»
-    + человек в файле посещаемости.
-    """
     record = Record(
+        id=0,
         telegram_id=profile.telegram_id,
         username=profile.nickname,
         workshop_id=workshop.id,
+        slot=slot,
         status=status,
         created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
-
-    # Сначала пишем в Google. Если Google барахлит — честно говорим
-    # пользователю повторить, и НЕ отправляем подтверждение.
     try:
-        await records.add_record(record)
+        db.add_record(record)
     except Exception as e:
         print(f"[records] не удалось сохранить запись: {e}")
         await message.answer(GOOGLE_RETRY)
         return
 
-    # Сбой файла посещаемости не должен ронять запись:
-    # главное — строка в «Записях», остальное поправим потом.
-    if workshop.attendance_file_id:
+    # В файл посещаемости попадают только «основные».
+    if status == "основной" and workshop.attendance_file_id:
         try:
             await attendance.add_person(
                 workshop.attendance_file_id,
-                profile.telegram_id,
+                workshop,
+                slot,
                 profile.full_name,
                 profile.group,
                 profile.nickname,
-                status,
+                profile.telegram_id,
             )
         except Exception as e:
             print(f"[attendance] не удалось добавить человека: {e}")
 
+    date = _slot_date(workshop, slot)
     if status == "основной":
-        await message.answer(SIGNED_MAIN.format(title=workshop.title))
+        await message.answer(SIGNED_MAIN.format(title=workshop.title, date=date))
     else:
-        await message.answer(RESERVE_DONE.format(title=workshop.title))
+        await message.answer(RESERVE_DONE.format(title=workshop.title, date=date))
+
+
+async def _try_promote(
+    bot, db: DB, attendance: AttendanceClient, workshop: Workshop, slot: int
+):
+    """Если освободилось место — поднимаем первого из резерва."""
+    if db.count_active(workshop.id, slot) >= workshop.quota:
+        return
+    res = db.first_reserve(workshop.id, slot)
+    if not res:
+        return
+
+    db.set_record_status(res.id, "основной")
+
+    if workshop.attendance_file_id:
+        p = db.get_profile(res.telegram_id)
+        if p:
+            try:
+                await attendance.add_person(
+                    workshop.attendance_file_id,
+                    workshop,
+                    slot,
+                    p.full_name,
+                    p.group,
+                    p.nickname,
+                    p.telegram_id,
+                )
+            except Exception as e:
+                print(f"[attendance] не удалось добавить поднятого: {e}")
+
+    try:
+        await bot.send_message(
+            res.telegram_id,
+            PROMOTED.format(title=workshop.title, date=_slot_date(workshop, slot)),
+        )
+    except Exception:
+        pass
+
+
+async def _enter_signup(
+    message: Message,
+    workshop: Workshop,
+    slot: int,
+    db: DB,
+    attendance: AttendanceClient,
+):
+    """Проверка мест по слоту и сама запись/резерв."""
+    tg_id = None  # заполняется вызывающим
+    return
+
+
 # ==================================================
-# КАЛЛБЭКИ ВОРОНКИ
+# КАЛЛБЭКИ
 # ==================================================
 
 @router.callback_query(F.data.startswith("fmt:"))
-async def cb_format(callback: CallbackQuery, sheets: SheetsClient):
-    """Выбран формат — показываем мастерские."""
+async def cb_format(callback: CallbackQuery, db: DB):
     await callback.answer()
-    fmt = callback.data.split(":", 1)[1]
-    await show_workshop_list(callback.message, sheets, fmt)
+    await show_workshop_list(callback.message, db, callback.data.split(":", 1)[1])
 
 
 @router.callback_query(F.data == "back:formats")
-async def cb_back_formats(callback: CallbackQuery, sheets: SheetsClient):
-    """Возврат к выбору формата."""
+async def cb_back_formats(callback: CallbackQuery, db: DB):
     await callback.answer()
-    await show_formats(callback.message, sheets)
+    await show_formats(callback.message, db)
 
 
 @router.callback_query(F.data.startswith("ws:"))
-async def cb_workshop_card(
-    callback: CallbackQuery,
-    sheets: SheetsClient,
-    records: RecordsClient,
-):
-    """Карточка мастерской со свободными местами."""
+async def cb_workshop_card(callback: CallbackQuery, db: DB):
     await callback.answer()
     ws_id = int(callback.data.split(":")[1])
-    workshop = await sheets.get_workshop_by_id(ws_id)
-    if not workshop:
+    w = db.get_workshop(ws_id)
+    if not w or w.deleted:
         await callback.message.answer("Мастерская не найдена.")
         return
 
-    taken = await records.count_active_records(ws_id)
-    free = max(workshop.quota - taken, 0)
+    free1 = max(w.quota - db.count_active(ws_id, 1), 0)
+    free2 = None
+    if w.format == "базовая" and w.date2:
+        free2 = max(w.quota - db.count_active(ws_id, 2), 0)
 
-    text = workshop_card_text(workshop, free)
-
-    sent = await _try_send_photo(
-        callback.message,
-        workshop.photo,
-        text,
-        reply_markup=kb_workshop_card(ws_id),
-    )
+    text = workshop_card_text(w, free1, free2)
+    sent = False
+    if w.photo:
+        try:
+            await callback.message.answer_photo(
+                w.photo, caption=text,
+                reply_markup=kb_workshop_card(ws_id), parse_mode="HTML",
+            )
+            sent = True
+        except Exception:
+            pass
     if not sent:
         await callback.message.answer(
             text, reply_markup=kb_workshop_card(ws_id), parse_mode="HTML"
@@ -230,144 +239,126 @@ async def cb_workshop_card(
 
 
 @router.callback_query(F.data == "back:workshops")
-async def cb_back_workshops(callback: CallbackQuery, sheets: SheetsClient):
-    """Возврат к списку мастерских того же формата."""
+async def cb_back_workshops(callback: CallbackQuery, db: DB):
     await callback.answer()
-    formats = await sheets.get_formats()
-    await callback.message.answer(CHOOSE_FORMAT, reply_markup=kb_formats())
+    await show_formats(callback.message, db)
 
 
 @router.callback_query(F.data.startswith("signup:"))
 async def cb_signup(
-    callback: CallbackQuery,
-    sheets: SheetsClient,
-    records: RecordsClient,
-    attendance: AttendanceClient,
+    callback: CallbackQuery, db: DB, attendance: AttendanceClient
 ):
-    """Кнопка «Записаться»."""
     await callback.answer()
     ws_id = int(callback.data.split(":")[1])
-    workshop = await sheets.get_workshop_by_id(ws_id)
-    if not workshop:
-        await callback.message.answer("Мастерская не найдена.")
-        return
-
-    if not workshop.is_open:
+    w = db.get_workshop(ws_id)
+    if not w or w.deleted or not w.is_open:
         await callback.message.answer("Запись на эту мастерскую не открыта.")
         return
 
     tg_id = callback.from_user.id
-
-    # Защита от двойной записи.
-    existing = await records.get_user_record(tg_id, ws_id)
-    if existing:
+    if db.get_user_record(tg_id, ws_id):
         await callback.message.answer(
-            ALREADY_SIGNED.format(status=existing.status)
+            ALREADY_SIGNED.format(status="активная")
         )
         return
 
-    taken = await records.count_active_records(ws_id)
-    free = max(workshop.quota - taken, 0)
-
-    if free <= 0:
-        # Квота заполнена — предлагаем резерв.
-        await callback.message.answer(
-            QUOTA_FULL.format(title=workshop.title),
-            reply_markup=kb_reserve(ws_id),
-        )
-        return
-
-    profile = await sheets.get_profile(tg_id)
+    profile = db.get_profile(tg_id)
     if not profile:
-        await callback.message.answer(
-            "Сначала заполни анкету.", reply_markup=kb_start()
-        )
+        await callback.message.answer("Сначала заполни анкету.", reply_markup=kb_start())
         return
 
-    await _do_register(
-        callback.message, profile, workshop, "основной", records, attendance
-    )
+    # Базовая с двумя датами — сначала выбор даты.
+    if w.format == "базовая" and w.date2:
+        await callback.message.answer(ASK_SLOT, reply_markup=kb_slot_dates(ws_id, w.date1, w.date2))
+        return
+
+    await _signup_slot(callback.message, profile, w, 1, db, attendance)
+
+
+@router.callback_query(F.data.startswith("slot:"))
+async def cb_slot(
+    callback: CallbackQuery, db: DB, attendance: AttendanceClient
+):
+    await callback.answer()
+    _, slot_raw, ws_raw = callback.data.split(":")
+    slot, ws_id = int(slot_raw), int(ws_raw)
+    w = db.get_workshop(ws_id)
+    if not w or w.deleted:
+        return
+    profile = db.get_profile(callback.from_user.id)
+    if not profile:
+        return
+    await _signup_slot(callback.message, profile, w, slot, db, attendance)
+
+
+async def _signup_slot(
+    message: Message,
+    profile: Profile,
+    w: Workshop,
+    slot: int,
+    db: DB,
+    attendance: AttendanceClient,
+):
+    free = max(w.quota - db.count_active(w.id, slot), 0)
+    if free <= 0:
+        await message.answer(
+            QUOTA_FULL.format(title=w.title), reply_markup=kb_reserve(w.id, slot)
+        )
+        return
+    await _do_register(message, profile, w, slot, "основной", db, attendance)
 
 
 @router.callback_query(F.data.startswith("reserve:"))
 async def cb_reserve(
-    callback: CallbackQuery,
-    sheets: SheetsClient,
-    records: RecordsClient,
-    attendance: AttendanceClient,
+    callback: CallbackQuery, db: DB, attendance: AttendanceClient
 ):
-    """Ответ на вопрос «Хотите в резерв?»."""
     await callback.answer()
-    _, answer, ws_id_raw = callback.data.split(":")
-    ws_id = int(ws_id_raw)
-    workshop = await sheets.get_workshop_by_id(ws_id)
-    if not workshop:
+    _, answer, ws_raw, slot_raw = callback.data.split(":")
+    w = db.get_workshop(int(ws_raw))
+    if not w:
         return
-
     if answer == "no":
         await callback.message.answer(RESERVE_NO)
         return
-
-    tg_id = callback.from_user.id
-    existing = await records.get_user_record(tg_id, ws_id)
-    if existing:
-        await callback.message.answer(
-            ALREADY_SIGNED.format(status=existing.status)
-        )
-        return
-
-    profile = await sheets.get_profile(tg_id)
+    profile = db.get_profile(callback.from_user.id)
     if not profile:
         return
-
     await _do_register(
-        callback.message, profile, workshop, "резерв", records, attendance
+        callback.message, profile, w, int(slot_raw), "резерв", db, attendance
     )
 
 
 # ==================================================
-# МОИ ЗАПИСИ И ОТМЕНА
+# ОТМЕНА + АВТОПОДЪЁМ
 # ==================================================
 
 @router.callback_query(F.data.startswith("cancel:"))
 async def cb_cancel(
-    callback: CallbackQuery,
-    sheets: SheetsClient,
-    records: RecordsClient,
-    attendance: AttendanceClient,
+    callback: CallbackQuery, db: DB, attendance: AttendanceClient
 ):
-    """Отмена записи: подтверждение и сама отмена."""
     await callback.answer()
-    _, action, ws_id_raw = callback.data.split(":")
-    ws_id = int(ws_id_raw)
-    workshop = await sheets.get_workshop_by_id(ws_id)
-    if not workshop:
+    _, action, ws_raw = callback.data.split(":")
+    ws_id = int(ws_raw)
+    w = db.get_workshop(ws_id)
+    if not w:
         return
 
     if action == "ask":
         await callback.message.answer(
-            ASK_CANCEL.format(title=workshop.title),
-            reply_markup=kb_cancel_confirm(ws_id),
+            ASK_CANCEL.format(title=w.title), reply_markup=kb_cancel_confirm(ws_id)
         )
         return
 
     if action == "no":
-        await show_my_records(
-            callback.message, callback.from_user.id, sheets, records
-        )
+        await show_my_records(callback.message, callback.from_user.id, db)
         return
 
-    # action == "yes": отменяем запись.
-    await records.update_status(callback.from_user.id, ws_id, "отменено")
-    if workshop.attendance_file_id:
-        try:
-            await attendance.remove_person(
-                workshop.attendance_file_id, callback.from_user.id
-            )
-        except Exception as e:
-            print(f"[attendance] не удалось убрать человека: {e}")
+    # action == "yes"
+    rec = db.get_user_record(callback.from_user.id, ws_id)
+    if rec:
+        db.set_record_status(rec.id, "отменено")
+        # человека из файла посещаемости НЕ убираем — он остаётся для преподавателя
+        await callback.message.answer(CANCEL_DONE.format(title=w.title))
+        await _try_promote(callback.bot, db, attendance, w, rec.slot)
 
-    await callback.message.answer(CANCEL_DONE.format(title=workshop.title))
-    await show_my_records(
-        callback.message, callback.from_user.id, sheets, records
-    )
+    await show_my_records(callback.message, callback.from_user.id, db)

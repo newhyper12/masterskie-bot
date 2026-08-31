@@ -1,10 +1,13 @@
 # models.py
+# Модели данных версии 2: SQLite как источник правды.
+
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional
+
 
 @dataclass
 class Profile:
-    """Анкета пользователя."""
     telegram_id: int
     full_name: str
     group: str
@@ -14,36 +17,39 @@ class Profile:
     consent_date: str
     updated_at: str
 
-@dataclass
-class FormatInfo:
-    """Формат мастерской (Базовый / Специальный)."""
-    name: str          # базовая / специальная
-    description: str
-    photo: str         # ID файла на Google Диске
 
 @dataclass
 class Workshop:
-    """Мастерская."""
     id: int
     title: str
-    format: str        # базовая / специальная
+    format: str                 # 'базовая' | 'специальная'
     description: str
-    date: str
-    location: str
-    lessons_count: int
-    days: str
-    quota: int
-    photo: str         # ID файла на Google Диске
-    open_date: Optional[str] # Дата/время открытия записи (строка из таблицы)
-    is_open: bool      # Открыта ли запись вручную (да/нет)
-    attendance_file_id: Optional[str] # ID файла посещаемости на Диске
-    close_date: str = ""   # дата/время автозакрытия записи (ISO) или ""
+    date1: str                  # базовая: первая дата; специальная: дата старта
+    date2: str = ""             # базовая: вторая дата (выбор при записи)
+    location: str = ""
+    lessons_count: int = 1
+    days: str = ""
+    quota: int = 0              # мест НА ОДНУ ДАТУ (базовая) или всего (спец.)
+    photo: str = ""
+    open_date: str = ""
+    close_date: str = ""
+    is_open: bool = False
+    attendance_file_id: str | None = None
+    deleted: bool = False
+
 
 @dataclass
 class Record:
-    """Запись пользователя на мастерскую."""
+    id: int
     telegram_id: int
-    username: str      # @username в Telegram
+    username: str
     workshop_id: int
-    status: str        # основной / резерв / отменено / отчислен
-    created_at: str    # Дата и время записи
+    slot: int                   # 1 или 2 для базовых, 1 для специальных
+    status: str                 # основной / резерв / отменено / отчислен
+    created_at: str
+
+
+@dataclass
+class FormatInfo:
+    name: str
+    photo: str
