@@ -161,6 +161,19 @@ class DB:
             result.append(w)
         return result
 
+    def get_workshops_raw(self, include_deleted: bool = False) -> List[Workshop]:
+        """Мастерские без пересчёта «открыта ли сейчас» (для планировщика)."""
+        rows = self.conn.execute(
+            "SELECT * FROM workshops ORDER BY id"
+        ).fetchall()
+        result = []
+        for row in rows:
+            w = self._row_to_workshop(row)
+            if w.deleted and not include_deleted:
+                continue
+            result.append(w)
+        return result
+
     def get_workshop(self, workshop_id: int) -> Optional[Workshop]:
         row = self.conn.execute(
             "SELECT * FROM workshops WHERE id=?", (workshop_id,)
@@ -177,7 +190,7 @@ class DB:
         with self.lock, self.conn:
             self.conn.execute(
                 """INSERT OR REPLACE INTO workshops VALUES
-                   (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (w.id, w.title, w.format, w.description, w.date1, w.date2,
                  w.location, w.lessons_count, w.days, w.quota, w.photo,
                  w.open_date, w.close_date, int(w.is_open),
@@ -291,7 +304,7 @@ class DB:
         )
 
     # ==================================================
-    # KV (фото приветствия и т.п.)
+    # KV (фото/текст приветствия и т.п.)
     # ==================================================
 
     def kv_get(self, key: str) -> Optional[str]:
@@ -346,15 +359,3 @@ class DB:
             (workshop_id,),
         ).fetchone()
         return row["c"] > 0
-
-    def get_workshops_raw(self, include_deleted: bool = False) -> List[Workshop]:
-        rows = self.conn.execute(
-            "SELECT * FROM workshops ORDER BY id"
-        ).fetchall()
-        result = []
-        for row in rows:
-            w = self._row_to_workshop(row)
-            if w.deleted and not include_deleted:
-                continue
-            result.append(w)
-        return result
