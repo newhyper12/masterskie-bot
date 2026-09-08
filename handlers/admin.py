@@ -1,9 +1,10 @@
 # handlers/admin.py
-# Админ-панель v2: создание (с двумя датами), расписание, редактирование,
-# удаление с бэкапом и удалением файла, восстановление, фото, напоминания.
+# Админ-панель v2: создание (с двумя датами и временем), расписание,
+# редактирование, удаление с бэкапом, восстановление, фото, напоминания.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime
 
@@ -53,6 +54,7 @@ from texts import (
     ADMIN_ASK_SET_PHOTO,
     ADMIN_ASK_START_TEXT,
     ADMIN_ASK_TITLE,
+    ADMIN_BAD_DATE,
     ADMIN_MENU_TEXT,
     ADMIN_PHOTO_SET,
     ADMIN_SCHEDULE_SAVED,
@@ -95,6 +97,22 @@ def _parse_dt(value: str) -> datetime | None:
         return datetime.strptime(value.strip(), "%d.%m.%Y %H:%M")
     except ValueError:
         return None
+
+
+def _parse_workshop_date(value: str) -> str | None:
+    """Принимает ДД.ММ.ГГГГ или ДД.ММ.ГГГГ ЧЧ:ММ, возвращает нормализованную строку."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            if fmt == "%d.%m.%Y %H:%M":
+                return dt.strftime("%d.%m.%Y %H:%M")
+            return dt.strftime("%d.%m.%Y")
+        except ValueError:
+            continue
+    return None
 
 
 # ==================================================
@@ -157,7 +175,11 @@ async def st_description(message: Message, state: FSMContext):
 
 @router.message(AdminWorkshopStates.date1)
 async def st_date1(message: Message, state: FSMContext):
-    await state.update_data(date1=(message.text or "").strip())
+    parsed = _parse_workshop_date(message.text or "")
+    if parsed is None:
+        await message.answer(ADMIN_BAD_DATE)
+        return
+    await state.update_data(date1=parsed)
     data = await state.get_data()
     if data.get("format") == "базовая":
         await state.set_state(AdminWorkshopStates.date2)
@@ -171,8 +193,14 @@ async def st_date1(message: Message, state: FSMContext):
 @router.message(AdminWorkshopStates.date2)
 async def st_date2(message: Message, state: FSMContext):
     value = (message.text or "").strip()
-    if value.lower() in ("нет", "-", "не"):
+    if value.lower() in ("нет", "-", "не", "no"):
         value = ""
+    else:
+        parsed = _parse_workshop_date(value)
+        if parsed is None:
+            await message.answer(ADMIN_BAD_DATE)
+            return
+        value = parsed
     await state.update_data(date2=value)
     await state.set_state(AdminWorkshopStates.location)
     await message.answer(ADMIN_ASK_LOCATION)
@@ -319,8 +347,19 @@ async def _finish_create(obj: Message, state: FSMContext, db: DB, attendance: At
         attendance_file_id=None,
     )
 
+    print(f"[admin] создаю файл посещаемости для мастерской {workshop.id}...")
     try:
-        workshop.attendance_file_id = await attendance.create(workshop)
+        workshop.attendance_file_id = await asyncio.wait_for(
+            attendance.create(workshop), timeout=90
+        )
+    except asyncio.TimeoutError:
+        await state.clear()
+        await obj.answer(
+            "⚠️ Google не ответил за 90 секунд при создании файла посещаемости. "
+            "Попробуй создать мастерскую ещё раз."
+        )
+        await obj.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
+        return
     except Exception as e:
         await state.clear()
         await obj.answer(
@@ -331,6 +370,7 @@ async def _finish_create(obj: Message, state: FSMContext, db: DB, attendance: At
         await obj.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
         return
 
+    print(f"[admin] файл создан: {workshop.attendance_file_id}")
     db.create_workshop(workshop)
     await state.clear()
 
@@ -492,10 +532,15 @@ async def st_edit_value(message: Message, state: FSMContext, db: DB):
             await message.answer("Нужно положительное число.")
             return
         db.update_workshop(ws_id, quota=int(value))
-    elif field == "date2":
-        if value.lower() in ("нет", "-", "не"):
-            value = ""
-        db.update_workshop(ws_id, date2=value)
+    elif field in ("date1", "date2"):
+        if field == "date2" and value.lower() in ("нет", "-", "не", "no"):
+            db.update_workshop(ws_id, date2="")
+        else:
+            parsed = _parse_workshop_date(value)
+            if parsed is None:
+                await message.answer(ADMIN_BAD_DATE)
+                return
+            db.update_workshop(ws_id, **{field: parsed})
     else:
         db.update_workshop(ws_id, **{field: value})
 
@@ -545,7 +590,21 @@ async def cb_del(
     scheduler: Scheduler,
 ):
     await callback.answer()
-    _, action, ws_raw = callback.data.split(":")
+    parts = callback.data.split(":")
+
+    # выбрали мастерскую из списка — показываем подтверждение
+    if len(parts) == 2:
+        ws_id = int(parts[1])
+        w = db.get_workshop(ws_id)
+        if not w:
+            return
+        await callback.message.answer(
+            DELETE_CONFIRM.format(title=w.title),
+            reply_markup=kb_confirm_delete(ws_id),
+        )
+        return
+
+    _, action, ws_raw = parts
     ws_id = int(ws_raw)
     w = db.get_workshop(ws_id)
     if not w:
@@ -555,13 +614,13 @@ async def cb_del(
         await callback.message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
         return
 
-    # Свежий бэкап перед удалением.
+    # свежий бэкап перед удалением
     try:
         await scheduler.backup_one(ws_id)
     except Exception as e:
         print(f"[backup] ошибка перед удалением: {e}")
 
-    # Удаляем файл с Диска.
+    # удаляем файл с Диска
     if w.attendance_file_id:
         try:
             await attendance.delete_file(w.attendance_file_id)
@@ -595,7 +654,21 @@ async def cb_rest(
     callback: CallbackQuery, db: DB, attendance: AttendanceClient
 ):
     await callback.answer()
-    _, action, ws_raw = callback.data.split(":")
+    parts = callback.data.split(":")
+
+    # выбрали мастерскую из списка — показываем подтверждение
+    if len(parts) == 2:
+        ws_id = int(parts[1])
+        w = db.get_workshop(ws_id)
+        if not w:
+            return
+        await callback.message.answer(
+            f"Восстановить «{w.title}» из последней резервной копии?",
+            reply_markup=kb_confirm_restore(ws_id),
+        )
+        return
+
+    _, action, ws_raw = parts
     ws_id = int(ws_raw)
     w = db.get_workshop(ws_id)
     if not w:

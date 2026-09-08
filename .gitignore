@@ -11,3 +11,10 @@ __pycache__/
 bot.db
 bot.db-wal
 bot.db-shm
+.env
+service_account.json
+oauth_client_secret.json
+oauth_token.json
+bot.db
+bot.db-wal
+bot.db-shm

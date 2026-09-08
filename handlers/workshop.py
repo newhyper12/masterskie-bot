@@ -1,5 +1,6 @@
 # handlers/workshop.py
 # Воронка записи версии 2: форматы -> мастерские -> (выбор даты) -> запись.
+# Записаться на базовую можно только на ОДНУ дату.
 # Отмена с автоподъёмом резерва. Всё из БД.
 
 from __future__ import annotations
@@ -179,18 +180,6 @@ async def _try_promote(
         pass
 
 
-async def _enter_signup(
-    message: Message,
-    workshop: Workshop,
-    slot: int,
-    db: DB,
-    attendance: AttendanceClient,
-):
-    """Проверка мест по слоту и сама запись/резерв."""
-    tg_id = None  # заполняется вызывающим
-    return
-
-
 # ==================================================
 # КАЛЛБЭКИ
 # ==================================================
@@ -257,9 +246,7 @@ async def cb_signup(
 
     tg_id = callback.from_user.id
     if db.get_user_record(tg_id, ws_id):
-        await callback.message.answer(
-            ALREADY_SIGNED.format(status="активная")
-        )
+        await callback.message.answer(ALREADY_SIGNED.format(status="активная"))
         return
 
     profile = db.get_profile(tg_id)
@@ -267,9 +254,11 @@ async def cb_signup(
         await callback.message.answer("Сначала заполни анкету.", reply_markup=kb_start())
         return
 
-    # Базовая с двумя датами — сначала выбор даты.
+    # Базовая с двумя датами — сначала выбор даты (только одной!).
     if w.format == "базовая" and w.date2:
-        await callback.message.answer(ASK_SLOT, reply_markup=kb_slot_dates(ws_id, w.date1, w.date2))
+        await callback.message.answer(
+            ASK_SLOT, reply_markup=kb_slot_dates(ws_id, w.date1, w.date2)
+        )
         return
 
     await _signup_slot(callback.message, profile, w, 1, db, attendance)
@@ -285,6 +274,12 @@ async def cb_slot(
     w = db.get_workshop(ws_id)
     if not w or w.deleted:
         return
+
+    # Защита от записи на обе даты: если уже есть активная запись — стоп.
+    if db.get_user_record(callback.from_user.id, ws_id):
+        await callback.message.answer(ALREADY_SIGNED.format(status="активная"))
+        return
+
     profile = db.get_profile(callback.from_user.id)
     if not profile:
         return
@@ -320,6 +315,12 @@ async def cb_reserve(
     if answer == "no":
         await callback.message.answer(RESERVE_NO)
         return
+
+    # И в резерв нельзя на вторую дату, если уже записан на первую.
+    if db.get_user_record(callback.from_user.id, w.id):
+        await callback.message.answer(ALREADY_SIGNED.format(status="активная"))
+        return
+
     profile = db.get_profile(callback.from_user.id)
     if not profile:
         return

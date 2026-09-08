@@ -60,7 +60,7 @@ class AttendanceClient:
                         ws.update_title(title)
                     else:
                         ws = spreadsheet.add_worksheet(
-                            title=title, rows=workshop.quota + EXTRA_ROWS + 1, columns=6
+                            title=title, rows=workshop.quota + EXTRA_ROWS + 1, cols=6
                         )
                     self._fill_basic(ws, workshop.quota)
             else:
@@ -213,6 +213,20 @@ class AttendanceClient:
         return await asyncio.to_thread(_sync)
 
     # ==================================================
+    # УДАЛЕНИЕ ФАЙЛА С ДИСКА
+    # ==================================================
+
+    async def delete_file(self, file_id: str):
+        """Удаляет файл с Диска от твоего аккаунта."""
+        def _sync():
+            creds = Credentials.from_authorized_user_file(
+                str(self.settings.oauth_token_file), SCOPES
+            )
+            drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+            drive.files().delete(fileId=file_id).execute()
+        await asyncio.to_thread(_sync)
+
+    # ==================================================
     # ДАМП И ВОССТАНОВЛЕНИЕ (для резервных копий)
     # ==================================================
 
@@ -237,7 +251,7 @@ class AttendanceClient:
                     ws = spreadsheet.add_worksheet(
                         title=sheet_title[:100],
                         rows=max(len(rows), 5),
-                        columns=max(len(rows[0]) if rows else 6, 6),
+                        cols=max(len(rows[0]) if rows else 6, 6),
                     )
                 if not rows:
                     continue
@@ -263,16 +277,6 @@ class AttendanceClient:
             return file_id
 
         return await asyncio.to_thread(_sync)
-
-    async def delete_file(self, file_id: str):
-        """Удаляет файл с Диска от твоего аккаунта."""
-        def _sync():
-            creds = Credentials.from_authorized_user_file(
-                str(self.settings.oauth_token_file), SCOPES
-            )
-            drive = build("drive", "v3", credentials=creds, cache_discovery=False)
-            drive.files().delete(fileId=file_id).execute()
-        await asyncio.to_thread(_sync)
 
 
 def quota_rows(quota: int) -> int:
