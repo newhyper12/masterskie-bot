@@ -1,9 +1,6 @@
 # handlers/start.py
-# /start: ОДНО приветственное сообщение:
-#   - текст/фото (можно кастомное с премиум-эмодзи),
-#   - inline-кнопки «📝 Регистрация на МК» и «📋 Мои записи»,
-#   - нижняя кнопка «🏠 Меню» под строкой ввода (reply-клавиатура).
-# Отдельного сообщения «Меню» НЕТ: нажатие «🏠 Меню» снова показывает приветствие.
+# /start: приветственное сообщение с inline-кнопками («Регистрация», «Мои записи»)
+# + нижняя кнопка «🏠 Меню» под строкой ввода. Отдельных сообщений «Меню» нет.
 
 from __future__ import annotations
 
@@ -43,29 +40,26 @@ async def _send_start(obj: Message, db: DB):
         except Exception:
             ents = None
 
+    # 1) Приветствие с inline-кнопками «Регистрация» и «Мои записи».
     sent = None
     if photo:
         try:
             sent = await obj.answer_photo(
                 photo, caption=text, caption_entities=ents,
-                reply_markup=kb_main_reply(),
+                reply_markup=kb_start(),
             )
         except Exception:
             sent = None
     if sent is None:
-        sent = await obj.answer(text, entities=ents, reply_markup=kb_main_reply())
+        sent = await obj.answer(text, entities=ents, reply_markup=kb_start())
 
-    # При отправке Telegram разрешает только одну клавиатуру, поэтому
-    # inline-кнопки цепляем к этому же сообщению сразу после отправки.
-    # Нижняя кнопка «🏠 Меню» при этом остаётся — она ставится в момент отправки.
+    # 2) Нижняя клавиатура «🏠 Меню»: ставим её служебным сообщением
+    #    и сразу удаляем его. Сообщений «Меню» пользователь не видит.
     try:
-        await obj.bot.edit_message_reply_markup(
-            chat_id=obj.chat.id,
-            message_id=sent.message_id,
-            reply_markup=kb_start(),
-        )
+        anchor = await obj.answer("\u200b", reply_markup=kb_main_reply())
+        await anchor.delete()
     except Exception as e:
-        print(f"[start] не удалось прицепить inline-кнопки: {e}")
+        print(f"[start] не удалось поставить нижнюю клавиатуру: {e}")
 
 
 @router.message(Command("start"))
@@ -79,7 +73,7 @@ async def cmd_start(message: Message, db: DB):
 
 @router.message(F.text == "🏠 Меню")
 async def msg_menu(message: Message, db: DB):
-    """Нижняя кнопка: просто показываем приветствие с кнопками заново."""
+    """Нижняя кнопка: показываем приветствие с кнопками заново."""
     await _send_start(message, db)
 
 
