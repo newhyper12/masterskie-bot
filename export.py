@@ -1,6 +1,7 @@
 # export.py
-# v3: глобальных таблиц больше нет. У каждой мастерской свой файл
-# «список участников», который раз в минуту пересоздаётся из БД.
+# v3: у каждой мастерской свой файл «список участников», который раз в минуту
+# пересоздаётся из БД. Служебные колонки (по заголовкам) — перезаписываются,
+# пользовательские (без заголовков из PARTICIPANTS_HEADERS) — сохраняются.
 # Статусы ровно три: Активный / Резерв / Отменился.
 
 from __future__ import annotations
@@ -70,9 +71,40 @@ class ExportClient:
             ])
 
         ws = self.gc.open_by_key(w.participants_file_id).worksheet("Участники")
+        existing = ws.get_all_values()
+        header_idx = {h: i for i, h in enumerate(PARTICIPANTS_HEADERS)}
+        user_cols = []
+        if existing:
+            first_row = existing[0]
+            for i, cell in enumerate(first_row):
+                if cell.strip() and cell not in header_idx:
+                    user_cols.append(i)
+
+        if user_cols and len(existing) > 1:
+            saved = {}
+            for r in existing[1:]:
+                key = ""
+                if len(r) > header_idx["telegram_id"]:
+                    key = str(r[header_idx["telegram_id"]]).strip()
+                if not key:
+                    continue
+                saved[key] = [r[i] if i < len(r) else "" for i in user_cols]
+            for row in rows[1:]:
+                key = str(row[0]).strip()
+                extras = saved.get(key, [""] * len(user_cols))
+                for idx, col in enumerate(user_cols):
+                    while len(row) <= col:
+                        row.append("")
+                    row[col] = extras[idx] if idx < len(extras) else ""
+
+        width = max(
+            len(rows[0]),
+            max(len(r) for r in rows) if len(rows) > 1 else 0,
+        )
+        padded = [r + [""] * (width - len(r)) for r in rows]
         ws.clear()
         ws.update(
-            f"A1:{col_letter(len(rows[0]))}{len(rows)}",
-            rows,
+            f"A1:{col_letter(width)}{len(padded)}",
+            padded,
             value_input_option="USER_ENTERED",
         )

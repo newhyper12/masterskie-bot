@@ -1,6 +1,7 @@
 # handlers/admin.py
-# Админ-панель v2: создание (с двумя датами и временем), расписание,
-# редактирование, удаление с бэкапом, восстановление, фото, напоминания.
+# Админ-панель v3: создание рабочей области (папка + 2 файла), расписание,
+# редактирование (без квоты, с пересбором посещаемости при правке дат),
+# удаление с бэкапом и удалением папки, восстановление, фото, напоминания.
 
 from __future__ import annotations
 
@@ -84,7 +85,6 @@ EDIT_LABELS = {
     "date1": "дата 1",
     "date2": "дата 2",
     "location": "место",
-    "quota": "квота",
 }
 
 
@@ -345,17 +345,22 @@ async def _finish_create(obj: Message, state: FSMContext, db: DB, attendance: At
         close_date=close_iso,
         is_open=is_open,
         attendance_file_id=None,
+        drive_folder_id=None,
+        participants_file_id=None,
     )
 
-    print(f"[admin] создаю файл посещаемости для мастерской {workshop.id}...")
+    print(f"[admin] создаю рабочую область для мастерской {workshop.id}...")
     try:
-        workshop.attendance_file_id = await asyncio.wait_for(
-            attendance.create(workshop), timeout=90
+        folder_id, p_id, a_id = await asyncio.wait_for(
+            attendance.create_workspace(workshop), timeout=90
         )
+        workshop.drive_folder_id = folder_id
+        workshop.participants_file_id = p_id
+        workshop.attendance_file_id = a_id
     except asyncio.TimeoutError:
         await state.clear()
         await obj.answer(
-            "⚠️ Google не ответил за 90 секунд при создании файла посещаемости. "
+            "⚠️ Google не ответил за 90 секунд при создании рабочей области. "
             "Попробуй создать мастерскую ещё раз."
         )
         await obj.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
@@ -363,14 +368,14 @@ async def _finish_create(obj: Message, state: FSMContext, db: DB, attendance: At
     except Exception as e:
         await state.clear()
         await obj.answer(
-            "⚠️ Не получилось создать файл посещаемости. "
+            "⚠️ Не получилось создать рабочую область. "
             "Обнови токен: python3 refresh_google_token.py"
         )
         await obj.answer(f"Детали: {str(e)[:200]}")
         await obj.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
         return
 
-    print(f"[admin] файл создан: {workshop.attendance_file_id}")
+    print(f"[admin] область создана: папка {folder_id}")
     db.create_workshop(workshop)
     await state.clear()
 
@@ -380,6 +385,8 @@ async def _finish_create(obj: Message, state: FSMContext, db: DB, attendance: At
         )
     )
     await obj.answer(
+        "📄 Список участников:\n"
+        f"https://docs.google.com/spreadsheets/d/{workshop.participants_file_id}\n\n"
         "📄 Файл посещаемости (отправь преподавателю):\n"
         f"https://docs.google.com/spreadsheets/d/{workshop.attendance_file_id}"
     )
@@ -477,7 +484,7 @@ async def _finish_schedule(obj: Message, state: FSMContext, db: DB, close_iso: s
 
 
 # ==================================================
-# РЕДАКТИРОВАНИЕ
+# РЕДАКТИРОВАНИЕ (без квоты; правка дат пересобирает посещаемость)
 # ==================================================
 
 @router.callback_query(F.data == "admin:edit")
@@ -521,18 +528,15 @@ async def cb_editf(callback: CallbackQuery, state: FSMContext):
 
 
 @router.message(AdminEditStates.value)
-async def st_edit_value(message: Message, state: FSMContext, db: DB):
+async def st_edit_value(
+    message: Message, state: FSMContext, db: DB, attendance: AttendanceClient
+):
     data = await state.get_data()
     field = data.get("edit_field", "title")
     ws_id = data.get("edit_ws")
     value = (message.text or "").strip()
 
-    if field == "quota":
-        if not value.isdigit() or int(value) < 1:
-            await message.answer("Нужно положительное число.")
-            return
-        db.update_workshop(ws_id, quota=int(value))
-    elif field in ("date1", "date2"):
+    if field in ("date1", "date2"):
         if field == "date2" and value.lower() in ("нет", "-", "не", "no"):
             db.update_workshop(ws_id, date2="")
         else:
@@ -541,6 +545,15 @@ async def st_edit_value(message: Message, state: FSMContext, db: DB):
                 await message.answer(ADMIN_BAD_DATE)
                 return
             db.update_workshop(ws_id, **{field: parsed})
+
+        # даты изменились — пересобираем файл посещаемости, сохраняя отметки
+        fresh = db.get_workshop(ws_id)
+        if fresh and fresh.attendance_file_id:
+            try:
+                new_a_id = await attendance.rebuild_attendance(fresh)
+                db.update_workshop(ws_id, attendance_file_id=new_a_id)
+            except Exception as e:
+                print(f"[admin] не удалось пересобрать посещаемость: {e}")
     else:
         db.update_workshop(ws_id, **{field: value})
 
@@ -620,12 +633,12 @@ async def cb_del(
     except Exception as e:
         print(f"[backup] ошибка перед удалением: {e}")
 
-    # удаляем файл с Диска
-    if w.attendance_file_id:
+    # удаляем папку мастерской вместе с обоими файлами
+    if w.drive_folder_id or w.attendance_file_id or w.participants_file_id:
         try:
-            await attendance.delete_file(w.attendance_file_id)
+            await attendance.delete_workspace(w)
         except Exception as e:
-            print(f"[drive] не удалось удалить файл: {e}")
+            print(f"[drive] не удалось удалить рабочую область: {e}")
 
     db.update_workshop(ws_id, deleted=True, is_open=False)
     await callback.message.answer(DELETE_DONE.format(title=w.title))
@@ -679,27 +692,26 @@ async def cb_rest(
         return
 
     backup = db.latest_backup(ws_id)
-    new_file_id = None
-    if backup and backup.get("attendance"):
-        try:
-            new_file_id = await attendance.restore(
-                f"{w.title} — посещаемость", backup["attendance"]
-            )
-        except Exception as e:
-            print(f"[restore] не удалось восстановить файл: {e}")
-    if not new_file_id:
-        try:
-            new_file_id = await attendance.create(w)
-        except Exception as e:
-            print(f"[restore] не удалось создать файл: {e}")
-
-    db.update_workshop(ws_id, deleted=False, attendance_file_id=new_file_id)
-    await callback.message.answer(RESTORE_DONE.format(title=w.title))
-    if new_file_id:
-        await callback.message.answer(
-            "📄 Новый файл посещаемости:\n"
-            f"https://docs.google.com/spreadsheets/d/{new_file_id}"
+    dump = backup.get("attendance") if backup else None
+    try:
+        folder_id, p_id, a_id = await attendance.restore_workspace(w, dump)
+        db.update_workshop(
+            ws_id,
+            deleted=False,
+            drive_folder_id=folder_id,
+            participants_file_id=p_id,
+            attendance_file_id=a_id,
         )
+        await callback.message.answer(RESTORE_DONE.format(title=w.title))
+        await callback.message.answer(
+            "📄 Список участников:\n"
+            f"https://docs.google.com/spreadsheets/d/{p_id}\n\n"
+            "📄 Файл посещаемости:\n"
+            f"https://docs.google.com/spreadsheets/d/{a_id}"
+        )
+    except Exception as e:
+        await callback.message.answer(f"⚠️ Не удалось восстановить: {str(e)[:200]}")
+
     await callback.message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
 
 

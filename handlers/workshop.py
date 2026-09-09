@@ -1,7 +1,5 @@
 # handlers/workshop.py
-# Воронка записи версии 2: форматы -> мастерские -> (выбор даты) -> запись.
-# Записаться на базовую можно только на ОДНУ дату.
-# Отмена с автоподъёмом резерва. Всё из БД.
+# Воронка записи v3: FIFO + срок 1 час, реальный статус, компактные даты.
 
 from __future__ import annotations
 
@@ -16,6 +14,7 @@ from keyboards import (
     kb_cancel_confirm,
     kb_formats,
     kb_my_records,
+    kb_promote_offer,
     kb_reserve,
     kb_slot_dates,
     kb_start,
@@ -24,7 +23,7 @@ from keyboards import (
 )
 from models import Profile, Record, Workshop
 from texts import (
-    ALREADY_SIGNED,
+    ALREADY_SIGNED_REAL,
     ASK_CANCEL,
     ASK_SLOT,
     CANCEL_DONE,
@@ -34,7 +33,11 @@ from texts import (
     MY_RECORDS_EMPTY,
     MY_RECORDS_TITLE,
     NO_WORKSHOPS,
-    PROMOTED,
+    PROMOTE_DECLINED,
+    PROMOTE_EXPIRED,
+    PROMOTE_OFFER,
+    PROMOTE_TIMEOUT,
+    PROMOTE_YES,
     QUOTA_FULL,
     RESERVE_DONE,
     RESERVE_NO,
@@ -45,6 +48,8 @@ from texts import (
 
 router = Router()
 
+PROMOTE_TTL_SEC = 3600
+
 
 def _slot_date(w: Workshop, slot: int) -> str:
     if w.format == "базовая":
@@ -52,9 +57,9 @@ def _slot_date(w: Workshop, slot: int) -> str:
     return w.date1
 
 
-# ==================================================
-# ЭКРАНЫ
-# ==================================================
+def _status_label(status: str) -> str:
+    return {"основной": "основной набор", "резерв": "резерв"}.get(status, status)
+
 
 async def show_formats(message: Message, db: DB):
     formats = db.get_formats()
@@ -92,10 +97,6 @@ async def show_my_records(message: Message, user_id: int, db: DB):
     await message.answer("\n".join(lines), reply_markup=kb_my_records(rows))
 
 
-# ==================================================
-# ЗАПИСЬ И РЕЗЕРВ
-# ==================================================
-
 async def _do_register(
     message: Message,
     profile: Profile,
@@ -121,7 +122,6 @@ async def _do_register(
         await message.answer(GOOGLE_RETRY)
         return
 
-    # В файл посещаемости попадают только «основные».
     if status == "основной" and workshop.attendance_file_id:
         try:
             await attendance.add_person(
@@ -143,46 +143,36 @@ async def _do_register(
         await message.answer(RESERVE_DONE.format(title=workshop.title, date=date))
 
 
-async def _try_promote(
-    bot, db: DB, attendance: AttendanceClient, workshop: Workshop, slot: int
-):
-    """Если освободилось место — поднимаем первого из резерва."""
+async def _offer_promotion(bot, db: DB, workshop: Workshop, slot: int):
+    """FIFO + срок 1 час. Если предложение старое — удаляем ключ и пробуем снова."""
     if db.count_active(workshop.id, slot) >= workshop.quota:
         return
-    res = db.first_reserve(workshop.id, slot)
-    if not res:
-        return
-
-    db.set_record_status(res.id, "основной")
-
-    if workshop.attendance_file_id:
-        p = db.get_profile(res.telegram_id)
-        if p:
+    now = datetime.now().timestamp()
+    for res in db.get_reserves(workshop.id, slot):
+        key = f"offer:{res.id}"
+        existing = db.kv_get(key)
+        if existing:
             try:
-                await attendance.add_person(
-                    workshop.attendance_file_id,
-                    workshop,
-                    slot,
-                    p.full_name,
-                    p.group,
-                    p.nickname,
-                    p.telegram_id,
-                )
-            except Exception as e:
-                print(f"[attendance] не удалось добавить поднятого: {e}")
+                _, ts_raw = existing.split(":", 1)
+                ts = float(ts_raw)
+                if now - ts < PROMOTE_TTL_SEC:
+                    continue  # предложение ещё действует
+                db.kv_set(key, "")
+            except Exception:
+                db.kv_set(key, "")
+        db.kv_set(key, f"{workshop.id}:{slot}:{now}")
+        try:
+            await bot.send_message(
+                res.telegram_id,
+                PROMOTE_OFFER.format(
+                    title=workshop.title, date=_slot_date(workshop, slot)
+                ),
+                reply_markup=kb_promote_offer(res.id),
+            )
+            return
+        except Exception:
+            db.kv_set(key, "")
 
-    try:
-        await bot.send_message(
-            res.telegram_id,
-            PROMOTED.format(title=workshop.title, date=_slot_date(workshop, slot)),
-        )
-    except Exception:
-        pass
-
-
-# ==================================================
-# КАЛЛБЭКИ
-# ==================================================
 
 @router.callback_query(F.data.startswith("fmt:"))
 async def cb_format(callback: CallbackQuery, db: DB):
@@ -245,8 +235,11 @@ async def cb_signup(
         return
 
     tg_id = callback.from_user.id
-    if db.get_user_record(tg_id, ws_id):
-        await callback.message.answer(ALREADY_SIGNED.format(status="активная"))
+    existing = db.get_user_record(tg_id, ws_id)
+    if existing:
+        await callback.message.answer(
+            ALREADY_SIGNED_REAL.format(status=_status_label(existing.status))
+        )
         return
 
     profile = db.get_profile(tg_id)
@@ -254,7 +247,6 @@ async def cb_signup(
         await callback.message.answer("Сначала заполни анкету.", reply_markup=kb_start())
         return
 
-    # Базовая с двумя датами — сначала выбор даты (только одной!).
     if w.format == "базовая" and w.date2:
         await callback.message.answer(
             ASK_SLOT, reply_markup=kb_slot_dates(ws_id, w.date1, w.date2)
@@ -275,9 +267,11 @@ async def cb_slot(
     if not w or w.deleted:
         return
 
-    # Защита от записи на обе даты: если уже есть активная запись — стоп.
-    if db.get_user_record(callback.from_user.id, ws_id):
-        await callback.message.answer(ALREADY_SIGNED.format(status="активная"))
+    existing = db.get_user_record(callback.from_user.id, ws_id)
+    if existing:
+        await callback.message.answer(
+            ALREADY_SIGNED_REAL.format(status=_status_label(existing.status))
+        )
         return
 
     profile = db.get_profile(callback.from_user.id)
@@ -316,9 +310,11 @@ async def cb_reserve(
         await callback.message.answer(RESERVE_NO)
         return
 
-    # И в резерв нельзя на вторую дату, если уже записан на первую.
-    if db.get_user_record(callback.from_user.id, w.id):
-        await callback.message.answer(ALREADY_SIGNED.format(status="активная"))
+    existing = db.get_user_record(callback.from_user.id, w.id)
+    if existing:
+        await callback.message.answer(
+            ALREADY_SIGNED_REAL.format(status=_status_label(existing.status))
+        )
         return
 
     profile = db.get_profile(callback.from_user.id)
@@ -329,9 +325,50 @@ async def cb_reserve(
     )
 
 
-# ==================================================
-# ОТМЕНА + АВТОПОДЪЁМ
-# ==================================================
+@router.callback_query(F.data.startswith("promote:"))
+async def cb_promote(
+    callback: CallbackQuery, db: DB, attendance: AttendanceClient
+):
+    await callback.answer()
+    _, answer, rec_raw = callback.data.split(":")
+    rec_id = int(rec_raw)
+
+    rec = db.get_record(rec_id)
+    db.kv_set(f"offer:{rec_id}", "")
+    if not rec:
+        return
+    w = db.get_workshop(rec.workshop_id)
+    if not w:
+        return
+
+    if answer == "no":
+        await callback.message.answer(PROMOTE_DECLINED)
+        await _offer_promotion(callback.bot, db, w, rec.slot)
+        return
+
+    if rec.status != "резерв":
+        await callback.message.answer(PROMOTE_EXPIRED)
+        return
+    if db.count_active(w.id, rec.slot) >= w.quota:
+        await callback.message.answer(PROMOTE_EXPIRED)
+        return
+
+    db.set_record_status(rec.id, "основной")
+    if w.attendance_file_id:
+        p = db.get_profile(rec.telegram_id)
+        if p:
+            try:
+                await attendance.add_person(
+                    w.attendance_file_id, w, rec.slot,
+                    p.full_name, p.group, p.nickname, p.telegram_id,
+                )
+            except Exception as e:
+                print(f"[attendance] не удалось добавить поднятого: {e}")
+
+    await callback.message.answer(
+        PROMOTE_YES.format(title=w.title, date=_slot_date(w, rec.slot))
+    )
+
 
 @router.callback_query(F.data.startswith("cancel:"))
 async def cb_cancel(
@@ -354,12 +391,11 @@ async def cb_cancel(
         await show_my_records(callback.message, callback.from_user.id, db)
         return
 
-    # action == "yes"
     rec = db.get_user_record(callback.from_user.id, ws_id)
     if rec:
         db.set_record_status(rec.id, "отменено")
-        # человека из файла посещаемости НЕ убираем — он остаётся для преподавателя
+        db.kv_set(f"offer:{rec.id}", "")
         await callback.message.answer(CANCEL_DONE.format(title=w.title))
-        await _try_promote(callback.bot, db, attendance, w, rec.slot)
+        await _offer_promotion(callback.bot, db, w, rec.slot)
 
     await show_my_records(callback.message, callback.from_user.id, db)

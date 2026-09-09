@@ -1,5 +1,5 @@
 # db.py
-# SQLite — источник правды бота. Все методы синхронные и быстрые (миллисекунды).
+# SQLite — источник правды бота. Авто-миграция схемы при старте.
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ class DB:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.lock = threading.Lock()
         self._init_schema()
+        self._migrate()
 
     def _init_schema(self):
         with self.lock, self.conn:
@@ -41,7 +42,8 @@ class DB:
                     lessons INTEGER, days TEXT, quota INTEGER,
                     photo TEXT, open_date TEXT, close_date TEXT,
                     is_open INTEGER, attendance_file_id TEXT,
-                    deleted INTEGER DEFAULT 0
+                    deleted INTEGER DEFAULT 0,
+                    drive_folder_id TEXT, participants_file_id TEXT
                 );
                 CREATE TABLE IF NOT EXISTS records (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,6 +63,15 @@ class DB:
                 );
                 """
             )
+
+    def _migrate(self):
+        """Добавляет недостающие колонки в старые таблицы."""
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(workshops)").fetchall()}
+        with self.lock, self.conn:
+            if "drive_folder_id" not in cols:
+                self.conn.execute("ALTER TABLE workshops ADD COLUMN drive_folder_id TEXT")
+            if "participants_file_id" not in cols:
+                self.conn.execute("ALTER TABLE workshops ADD COLUMN participants_file_id TEXT")
 
     # ==================================================
     # ПРОФИЛИ
@@ -122,6 +133,8 @@ class DB:
             is_open=bool(row["is_open"]),
             attendance_file_id=row["attendance_file_id"] or None,
             deleted=bool(row["deleted"]),
+            drive_folder_id=row["drive_folder_id"] if "drive_folder_id" in row.keys() else None,
+            participants_file_id=row["participants_file_id"] if "participants_file_id" in row.keys() else None,
         )
 
     def get_workshops(
@@ -162,7 +175,6 @@ class DB:
         return result
 
     def get_workshops_raw(self, include_deleted: bool = False) -> List[Workshop]:
-        """Мастерские без пересчёта «открыта ли сейчас» (для планировщика)."""
         rows = self.conn.execute(
             "SELECT * FROM workshops ORDER BY id"
         ).fetchall()
@@ -190,19 +202,20 @@ class DB:
         with self.lock, self.conn:
             self.conn.execute(
                 """INSERT OR REPLACE INTO workshops VALUES
-                   (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (w.id, w.title, w.format, w.description, w.date1, w.date2,
                  w.location, w.lessons_count, w.days, w.quota, w.photo,
                  w.open_date, w.close_date, int(w.is_open),
-                 w.attendance_file_id, int(w.deleted)),
+                 w.attendance_file_id, int(w.deleted),
+                 w.drive_folder_id, w.participants_file_id),
             )
 
     def update_workshop(self, workshop_id: int, **fields):
-        """Точечное обновление полей мастерской."""
         allowed = {
             "title", "format", "description", "date1", "date2", "location",
             "lessons_count", "days", "quota", "photo", "open_date",
             "close_date", "is_open", "attendance_file_id", "deleted",
+            "drive_folder_id", "participants_file_id",
         }
         cols, vals = [], []
         for k, v in fields.items():
@@ -246,7 +259,7 @@ class DB:
                ORDER BY id DESC LIMIT 1""",
             (telegram_id, workshop_id, *ACTIVE),
         ).fetchone()
-        return self._row_to_record(row) if row else None
+        return self._row_to_records(row) if row else None
 
     def get_user_records(self, telegram_id: int) -> List[Record]:
         rows = self.conn.execute(
@@ -254,7 +267,7 @@ class DB:
                ORDER BY id""",
             (telegram_id, *ACTIVE),
         ).fetchall()
-        return [self._row_to_record(r) for r in rows]
+        return [self._row_to_records(r) for r in rows]
 
     def count_active(self, workshop_id: int, slot: int) -> int:
         row = self.conn.execute(
@@ -274,11 +287,11 @@ class DB:
             f"SELECT * FROM records WHERE workshop_id=? AND status IN ({q})",
             (workshop_id, *statuses),
         ).fetchall()
-        return [self._row_to_record(r) for r in rows]
+        return [self._row_to_records(r) for r in rows]
 
     def all_records(self) -> List[Record]:
         rows = self.conn.execute("SELECT * FROM records ORDER BY id").fetchall()
-        return [self._row_to_record(r) for r in rows]
+        return [self._row_to_records(r) for r in rows]
 
     def set_record_status(self, record_id: int, status: str):
         with self.lock, self.conn:
@@ -293,10 +306,25 @@ class DB:
                ORDER BY id LIMIT 1""",
             (workshop_id, slot),
         ).fetchone()
-        return self._row_to_record(row) if row else None
+        return self._row_to_records(row) if row else None
+
+    def get_record(self, record_id: int) -> Optional[Record]:
+        row = self.conn.execute(
+            "SELECT * FROM records WHERE id=?", (record_id,)
+        ).fetchone()
+        return self._row_to_records(row) if row else None
+
+    def get_reserves(self, workshop_id: int, slot: int) -> List[Record]:
+        rows = self.conn.execute(
+            """SELECT * FROM records
+               WHERE workshop_id=? AND slot=? AND status='резерв'
+               ORDER BY id""",
+            (workshop_id, slot),
+        ).fetchall()
+        return [self._row_to_records(r) for r in rows]
 
     @staticmethod
-    def _row_to_record(row) -> Record:
+    def _row_to_records(row) -> Record:
         return Record(
             id=row["id"], telegram_id=row["telegram_id"],
             username=row["username"], workshop_id=row["workshop_id"],
@@ -304,7 +332,7 @@ class DB:
         )
 
     # ==================================================
-    # KV (фото/текст приветствия и т.п.)
+    # KV (фото/текст приветствия, ключи предложений)
     # ==================================================
 
     def kv_get(self, key: str) -> Optional[str]:

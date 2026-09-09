@@ -1,5 +1,6 @@
 # handlers/start.py
-# /start одним сообщением + входы в воронки.
+# /start одним сообщением + постоянная нижняя кнопка «🏠 Меню» для всех устройств.
+# Фото и текст могут работать вместе.
 
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message, MessageEntity
 
 from db import DB
-from keyboards import kb_consent, kb_start
+from keyboards import kb_consent, kb_main_reply, kb_start
 from states import SurveyStates
 from texts import CONSENT_TEXT, START_TEXT
 
@@ -19,8 +20,12 @@ router = Router()
 
 
 async def _send_start(message: Message, db: DB):
-    """Одно приветственное сообщение с inline-меню."""
+    """Фото + текст вместе, если заданы оба."""
+    photo = db.kv_get("START_PHOTO_ID")
     stored = db.kv_get("START_MESSAGE")
+
+    ents = None
+    text = START_TEXT
     if stored:
         try:
             data = json.loads(stored)
@@ -32,19 +37,24 @@ async def _send_start(message: Message, db: DB):
                 for e in data.get("entities", [])
                 if e["type"] in ("custom_emoji", "bold", "italic", "underline")
             ]
-            await message.answer(data["text"], entities=ents, reply_markup=kb_start())
+            text = data["text"]
+        except Exception:
+            ents = None
+
+    if photo:
+        try:
+            await message.answer_photo(
+                photo, caption=text, entities=ents, reply_markup=kb_main_reply()
+            )
             return
         except Exception:
             pass
 
-    photo = db.kv_get("START_PHOTO_ID")
-    if photo:
-        try:
-            await message.answer_photo(photo, caption=START_TEXT, reply_markup=kb_start())
-            return
-        except Exception:
-            pass
-    await message.answer(START_TEXT, reply_markup=kb_start())
+    await message.answer(text, entities=ents, reply_markup=kb_main_reply())
+
+
+async def _send_menu(obj):
+    await obj.answer("Меню 👇", reply_markup=kb_start())
 
 
 @router.message(Command("start"))
@@ -52,9 +62,10 @@ async def cmd_start(message: Message, db: DB):
     await _send_start(message, db)
 
 
-# ==================================================
-# ТЕКСТОВЫЕ КНОПКИ (если у кого-то осталась нижняя клавиатура)
-# ==================================================
+@router.message(F.text == "🏠 Меню")
+async def msg_menu(message: Message, db: DB):
+    await _send_menu(message)
+
 
 @router.message(F.text == "📝 Регистрация на МК")
 async def msg_register(message: Message, state: FSMContext, db: DB):
@@ -66,11 +77,6 @@ async def msg_my(message: Message, state: FSMContext, db: DB):
     await require_profile_msg(message, "my", state, db)
 
 
-@router.message(F.text == "🏠 Меню")
-async def msg_old_menu(message: Message, db: DB):
-    await _send_start(message, db)
-
-
 async def require_profile_msg(message: Message, after: str, state: FSMContext, db: DB):
     profile = db.get_profile(message.from_user.id)
     if profile:
@@ -80,10 +86,6 @@ async def require_profile_msg(message: Message, after: str, state: FSMContext, d
     await state.set_state(SurveyStates.consent)
     await message.answer(CONSENT_TEXT, reply_markup=kb_consent())
 
-
-# ==================================================
-# INLINE-ВХОДЫ
-# ==================================================
 
 @router.callback_query(F.data == "menu:register")
 async def cb_register(callback: CallbackQuery, state: FSMContext, db: DB):
@@ -98,7 +100,7 @@ async def cb_my(callback: CallbackQuery, state: FSMContext, db: DB):
 @router.callback_query(F.data == "back:menu")
 async def cb_back_menu(callback: CallbackQuery, db: DB):
     await callback.answer()
-    await _send_start(callback.message, db)
+    await _send_menu(callback.message)
 
 
 async def require_profile(callback: CallbackQuery, after: str, state: FSMContext, db: DB):
