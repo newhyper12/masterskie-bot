@@ -1,144 +1,57 @@
 # google_drive.py
-# Работа с Google Диском: папка проекта, файлы таблиц, фотографии.
+# Операции с Drive от имени твоего аккаунта (OAuth):
+# папки, файлы, расшаривание сервис-аккаунту, удаление.
 
 from __future__ import annotations
 
-import io
-from pathlib import Path
+import json
 
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
-# Права на работу с Диском.
-DRIVE_SCOPES = [
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
-# MIME-тип Google Таблицы при создании файла на Диске.
-SPREADSHEET_MIME = "application/vnd.google-apps.spreadsheet"
 
-# MIME-тип папки.
-FOLDER_MIME = "application/vnd.google-apps.folder"
-
-
-def get_sa_credentials(path: Path):
-    """
-    Создаёт credentials сервисного аккаунта из JSON-ключа.
-    Используется ботом для работы с Диском.
-    """
-    return service_account.Credentials.from_service_account_file(
-        str(path),
-        scopes=DRIVE_SCOPES,
+def user_drive(settings):
+    creds = Credentials.from_authorized_user_file(
+        str(settings.oauth_token_file), SCOPES
     )
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def build_drive_service(credentials):
-    """
-    Собирает клиент Drive API из готовых credentials.
-
-    На вход можно подать:
-    - credentials сервисного аккаунта (get_sa_credentials);
-    - credentials пользователя из gspread.oauth (gc.auth) — для init-скрипта.
-    """
-    return build(
-        "drive",
-        "v3",
-        credentials=credentials,
-        cache_discovery=False,
-    )
+def service_account_email(settings) -> str:
+    with open(settings.service_account_file, encoding="utf-8") as f:
+        return json.load(f)["client_email"]
 
 
-def get_sa_drive_service(path: Path):
-    """Готовый Drive-клиент для сервисного аккаунта."""
-    return build_drive_service(get_sa_credentials(path))
-
-
-def create_folder(drive, title: str) -> str:
-    """Создаёт папку на Диске и возвращает её ID."""
+def create_folder(drive, name: str, parent_id: str) -> str:
     body = {
-        "name": title,
-        "mimeType": FOLDER_MIME,
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
     }
-    file = drive.files().create(body=body, fields="id").execute()
-    return file["id"]
+    return drive.files().create(body=body, fields="id").execute()["id"]
 
 
 def create_spreadsheet_in_folder(drive, title: str, folder_id: str) -> str:
-    """
-    Создаёт пустую Google Таблицу внутри папки и возвращает её ID.
-    Именно так бот будет создавать файлы посещаемости.
-    """
     body = {
         "name": title,
-        "mimeType": SPREADSHEET_MIME,
+        "mimeType": "application/vnd.google-apps.spreadsheet",
         "parents": [folder_id],
     }
-    file = drive.files().create(body=body, fields="id").execute()
-    return file["id"]
+    return drive.files().create(body=body, fields="id").execute()["id"]
 
 
-def share_file(
-    drive,
-    file_id: str,
-    email: str,
-    role: str = "writer",
-) -> None:
-    """
-    Выдаёт доступ к файлу/папке.
-
-    role="writer" — может редактировать (нужно сервисному аккаунту).
-    """
+def share_with(drive, file_id: str, email: str, role: str = "writer"):
     drive.permissions().create(
         fileId=file_id,
-        body={
-            "type": "user",
-            "role": role,
-            "emailAddress": email,
-        },
+        body={"type": "user", "role": role, "emailAddress": email},
         fields="id",
     ).execute()
 
 
-def upload_file_bytes(
-    drive,
-    folder_id: str,
-    name: str,
-    data: bytes,
-    mime_type: str = "image/jpeg",
-) -> str:
-    """
-    Загружает файл (фото) в папку на Диске.
-    Возвращает ID файла — его храним в таблице в колонке «фото».
-    """
-    media = MediaIoBaseUpload(
-        io.BytesIO(data),
-        mimetype=mime_type,
-        resumable=False,
-    )
-    body = {
-        "name": name,
-        "parents": [folder_id],
-    }
-    file = drive.files().create(
-        body=body,
-        media_body=media,
-        fields="id",
-    ).execute()
-    return file["id"]
-
-
-def download_file_bytes(drive, file_id: str) -> bytes:
-    """
-    Скачивает файл с Диска по ID и возвращает байты.
-    Используется, чтобы отправить фото из Диска в Telegram.
-    """
-    buffer = io.BytesIO()
-    request = drive.files().get_media(fileId=file_id)
-    downloader = MediaIoBaseDownload(buffer, request)
-
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-
-    return buffer.getvalue()
+def delete_file(drive, file_id: str):
+    drive.files().delete(fileId=file_id).execute()

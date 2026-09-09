@@ -1,27 +1,31 @@
 # attendance.py
-# Файлы посещаемости версии 2:
-#  - базовая мастерская  -> два листа (по одному на дату), один чекбокс «Отметка»;
-#  - специальная         -> один лист, чекбоксы по занятиям;
-#  - строк всегда квота + 7 (запас под отменившихся — они остаются в файле);
-#  - резерва в файле больше нет (резерв живёт в БД).
+# Рабочая область мастерской на Диске, v3:
+#   {корень}/«{id}. {название}»/
+#       ├── «{название} — список участников»  (регенерирует export.py из БД)
+#       └── «{название} — посещаемость»       (файл преподавателя, отметки не трогаем)
 
 from __future__ import annotations
 
 import asyncio
 
 import gspread
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
 
 from config import Settings
-from google_drive import create_spreadsheet_in_folder
+from google_drive import (
+    create_folder,
+    create_spreadsheet_in_folder,
+    delete_file,
+    service_account_email,
+    share_with,
+    user_drive,
+)
 from models import Workshop
 
 EXTRA_ROWS = 7  # запас строк под отменившихся
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
+PARTICIPANTS_HEADERS = [
+    "telegram_id", "ФИО", "группа", "телефон", "почта",
+    "контакт", "дата", "статус", "дата записи",
 ]
 
 
@@ -41,59 +45,98 @@ class AttendanceClient:
         )
 
     # ==================================================
-    # СОЗДАНИЕ ФАЙЛА
+    # СОЗДАНИЕ РАБОЧЕЙ ОБЛАСТИ (папка + 2 файла)
     # ==================================================
 
-    async def create(self, workshop: Workshop) -> str:
+    async def create_workspace(self, w: Workshop) -> tuple:
+        """Возвращает (drive_folder_id, participants_file_id, attendance_file_id)."""
         def _sync():
-            file_id = self._create_file_on_drive(f"{workshop.title} — посещаемость")
-            spreadsheet = self.gc.open_by_key(file_id)
+            drive = user_drive(self.settings)
+            sa = service_account_email(self.settings)
 
-            if workshop.format == "базовая":
-                dates = [workshop.date1]
-                if workshop.date2:
-                    dates.append(workshop.date2)
-                for i, d in enumerate(dates):
-                    title = (d or f"Занятие {i + 1}")[:100]
-                    if i == 0:
-                        ws = spreadsheet.get_worksheet(0)
-                        ws.update_title(title)
-                    else:
-                        ws = spreadsheet.add_worksheet(
-                            title=title, rows=workshop.quota + EXTRA_ROWS + 1, cols=6
-                        )
-                    self._fill_basic(ws, workshop.quota)
-            else:
-                ws = spreadsheet.get_worksheet(0)
-                ws.update_title("Посещаемость")
-                self._fill_special(ws, workshop)
+            folder_id = create_folder(
+                drive, f"{w.id}. {w.title}", self.settings.drive_folder_id
+            )
+            p_id = create_spreadsheet_in_folder(
+                drive, f"{w.title} — список участников", folder_id
+            )
+            a_id = create_spreadsheet_in_folder(
+                drive, f"{w.title} — посещаемость", folder_id
+            )
+            share_with(drive, p_id, sa)
+            share_with(drive, a_id, sa)
 
-            return file_id
+            p_ws = self.gc.open_by_key(p_id).get_worksheet(0)
+            p_ws.update_title("Участники")
+            p_ws.update(
+                f"A1:{col_letter(len(PARTICIPANTS_HEADERS))}1",
+                [PARTICIPANTS_HEADERS],
+                value_input_option="USER_ENTERED",
+            )
+
+            a_sp = self.gc.open_by_key(a_id)
+            self._fill_attendance_sheets(a_sp, w, old_dump=None)
+            return folder_id, p_id, a_id
 
         return await asyncio.to_thread(_sync)
 
-    def _create_file_on_drive(self, title: str) -> str:
-        creds = Credentials.from_authorized_user_file(
-            str(self.settings.oauth_token_file), SCOPES
-        )
-        user_drive = build("drive", "v3", credentials=creds, cache_discovery=False)
-        return create_spreadsheet_in_folder(
-            user_drive, title, self.settings.drive_folder_id
-        )
+    # ==================================================
+    # ЛИСТЫ ПОСЕЩАЕМОСТИ
+    # ==================================================
+
+    def _fill_attendance_sheets(self, spreadsheet, w: Workshop, old_dump: dict | None):
+        """Создаёт листы посещаемости; если в old_dump есть лист с таким же
+        заголовком — переносит его строки вместе с отметками."""
+        if w.format == "базовая":
+            dates = [w.date1] + ([w.date2] if w.date2 else [])
+            titles = [(d or f"Занятие {i + 1}")[:100] for i, d in enumerate(dates)]
+        else:
+            titles = ["Посещаемость"]
+
+        for i, title in enumerate(titles):
+            if i == 0:
+                ws = spreadsheet.get_worksheet(0)
+                ws.update_title(title)
+            else:
+                ws = spreadsheet.add_worksheet(
+                    title=title, rows=w.quota + EXTRA_ROWS + 2, cols=8
+                )
+
+            old_rows = (old_dump or {}).get(title)
+            if old_rows:
+                width = max(len(r) for r in old_rows)
+                padded = [r + [""] * (width - len(r)) for r in old_rows]
+                ws.update(
+                    f"A1:{col_letter(width)}{len(padded)}",
+                    padded,
+                    value_input_option="USER_ENTERED",
+                )
+                header = old_rows[0]
+                mark_cols = [
+                    j for j, h in enumerate(header)
+                    if str(h).strip() == "Отметка" or str(h).startswith("Занятие")
+                ]
+                hide = None
+                for j, h in enumerate(header):
+                    if str(h).strip().lower() == "telegram_id":
+                        hide = j
+                if hide is not None:
+                    self._apply_formatting(ws, len(padded), mark_cols, hide)
+            elif w.format == "базовая":
+                self._fill_basic(ws, w.quota)
+            else:
+                self._fill_special(ws, w)
 
     def _fill_basic(self, ws, quota: int):
-        """Лист базовой мастерской: одна отметка, квота+7 строк."""
         rows = [["№ п/п", "ФИО", "Группа", "Ссылка в телеграм", "Отметка", "telegram_id"]]
         for i in range(1, quota + EXTRA_ROWS + 1):
             rows.append([i, "", "", "", "", ""])
         last = len(rows)
-
         ws.update(f"A1:F{last}", rows, value_input_option="USER_ENTERED")
         self._apply_formatting(ws, last, mark_cols=[4], hide_col=5)
 
-    def _fill_special(self, ws, workshop: Workshop):
-        """Лист специальной: чекбоксы по занятиям, квота+7 строк."""
-        lessons = max(workshop.lessons_count or 1, 1)
+    def _fill_special(self, ws, w: Workshop):
+        lessons = max(w.lessons_count or 1, 1)
         sess_start = "E"
         last_sess = col_letter(4 + lessons)
         hidden_col = col_letter(6 + lessons)
@@ -103,7 +146,7 @@ class AttendanceClient:
         header += ["Посещено занятий", "telegram_id"]
         rows = [header]
 
-        for i in range(1, quota_rows(workshop.quota) + 1):
+        for i in range(1, quota_rows(w.quota) + 1):
             r = len(rows) + 1
             rows.append([
                 i, "", "", "",
@@ -127,7 +170,6 @@ class AttendanceClient:
         )
 
     def _apply_formatting(self, ws, last_row: int, mark_cols: list, hide_col: int):
-        """Закрепление шапки, чекбоксы, скрытие служебной колонки."""
         spreadsheet = ws.spreadsheet
         requests = [
             {
@@ -172,11 +214,11 @@ class AttendanceClient:
             pass
 
     # ==================================================
-    # ЛЮДИ В ФАЙЛЕ
+    # ЛЮДИ В ФАЙЛЕ ПОСЕЩАЕМОСТИ
     # ==================================================
 
-    def _target_sheet(self, spreadsheet, workshop: Workshop, slot: int):
-        if workshop.format == "базовая":
+    def _target_sheet(self, spreadsheet, w: Workshop, slot: int):
+        if w.format == "базовая":
             idx = 0 if slot == 1 else 1
             sheets = spreadsheet.worksheets()
             return sheets[min(idx, len(sheets) - 1)]
@@ -185,17 +227,16 @@ class AttendanceClient:
     async def add_person(
         self,
         file_id: str,
-        workshop: Workshop,
+        w: Workshop,
         slot: int,
         full_name: str,
         group: str,
         link: str,
         telegram_id: int,
     ) -> bool:
-        """Ставит человека в первую пустую строку нужного листа."""
         def _sync():
             spreadsheet = self.gc.open_by_key(file_id)
-            ws = self._target_sheet(spreadsheet, workshop, slot)
+            ws = self._target_sheet(spreadsheet, w, slot)
             values = ws.get_all_values()
             hidden_idx = len(values[0]) - 1 if values else 5
 
@@ -213,70 +254,97 @@ class AttendanceClient:
         return await asyncio.to_thread(_sync)
 
     # ==================================================
-    # УДАЛЕНИЕ ФАЙЛА С ДИСКА
+    # ДАМП / ВОССТАНОВЛЕНИЕ / ПЕРЕСБОР / УДАЛЕНИЕ
     # ==================================================
 
-    async def delete_file(self, file_id: str):
-        """Удаляет файл с Диска от твоего аккаунта."""
+    def dump_attendance_sync(self, file_id: str) -> dict:
+        spreadsheet = self.gc.open_by_key(file_id)
+        return {ws.title: ws.get_all_values() for ws in spreadsheet.worksheets()}
+
+    async def dump_attendance(self, file_id: str) -> dict:
+        return await asyncio.to_thread(self.dump_attendance_sync, file_id)
+
+    async def restore_workspace(self, w: Workshop, dump: dict | None) -> tuple:
+        """Пересоздаёт папку и оба файла; листы посещаемости — из дампа."""
         def _sync():
-            creds = Credentials.from_authorized_user_file(
-                str(self.settings.oauth_token_file), SCOPES
+            drive = user_drive(self.settings)
+            sa = service_account_email(self.settings)
+
+            folder_id = create_folder(
+                drive, f"{w.id}. {w.title}", self.settings.drive_folder_id
             )
-            drive = build("drive", "v3", credentials=creds, cache_discovery=False)
-            drive.files().delete(fileId=file_id).execute()
+            p_id = create_spreadsheet_in_folder(
+                drive, f"{w.title} — список участников", folder_id
+            )
+            a_id = create_spreadsheet_in_folder(
+                drive, f"{w.title} — посещаемость", folder_id
+            )
+            share_with(drive, p_id, sa)
+            share_with(drive, a_id, sa)
+
+            p_ws = self.gc.open_by_key(p_id).get_worksheet(0)
+            p_ws.update_title("Участники")
+            p_ws.update(
+                f"A1:{col_letter(len(PARTICIPANTS_HEADERS))}1",
+                [PARTICIPANTS_HEADERS],
+                value_input_option="USER_ENTERED",
+            )
+
+            a_sp = self.gc.open_by_key(a_id)
+            self._fill_attendance_sheets(a_sp, w, old_dump=dump)
+            return folder_id, p_id, a_id
+
+        return await asyncio.to_thread(_sync)
+
+    async def rebuild_attendance(self, w: Workshop) -> str:
+        """Пересоздаёт файл посещаемости (после правки дат), сохраняя отметки
+        листов, чьи заголовки не изменились. Возвращает новый file_id."""
+        def _sync():
+            old = {}
+            if w.attendance_file_id:
+                try:
+                    old = self.dump_attendance_sync(w.attendance_file_id)
+                except Exception:
+                    old = {}
+                try:
+                    delete_file(user_drive(self.settings), w.attendance_file_id)
+                except Exception:
+                    pass
+
+            drive = user_drive(self.settings)
+            sa = service_account_email(self.settings)
+            folder_id = w.drive_folder_id or create_folder(
+                drive, f"{w.id}. {w.title}", self.settings.drive_folder_id
+            )
+            a_id = create_spreadsheet_in_folder(
+                drive, f"{w.title} — посещаемость", folder_id
+            )
+            share_with(drive, a_id, sa)
+
+            a_sp = self.gc.open_by_key(a_id)
+            self._fill_attendance_sheets(a_sp, w, old_dump=old)
+            return a_id
+
+        return await asyncio.to_thread(_sync)
+
+    async def delete_workspace(self, w: Workshop):
+        """Удаляет папку мастерской вместе с обоими файлами."""
+        def _sync():
+            drive = user_drive(self.settings)
+            if w.drive_folder_id:
+                try:
+                    delete_file(drive, w.drive_folder_id)
+                    return
+                except Exception as e:
+                    print(f"[drive] папку не удалось удалить: {e}")
+            for fid in (w.participants_file_id, w.attendance_file_id):
+                if fid:
+                    try:
+                        delete_file(drive, fid)
+                    except Exception:
+                        pass
+
         await asyncio.to_thread(_sync)
-
-    # ==================================================
-    # ДАМП И ВОССТАНОВЛЕНИЕ (для резервных копий)
-    # ==================================================
-
-    async def dump(self, file_id: str) -> dict:
-        """Все листы файла как {название: [[...], ...]}."""
-        def _sync():
-            spreadsheet = self.gc.open_by_key(file_id)
-            return {ws.title: ws.get_all_values() for ws in spreadsheet.worksheets()}
-        return await asyncio.to_thread(_sync)
-
-    async def restore(self, title: str, dump: dict) -> str:
-        """Пересоздаёт файл посещаемости из дампа. Возвращает новый file_id."""
-        def _sync():
-            file_id = self._create_file_on_drive(title)
-            spreadsheet = self.gc.open_by_key(file_id)
-
-            for i, (sheet_title, rows) in enumerate(dump.items()):
-                if i == 0:
-                    ws = spreadsheet.get_worksheet(0)
-                    ws.update_title(sheet_title[:100])
-                else:
-                    ws = spreadsheet.add_worksheet(
-                        title=sheet_title[:100],
-                        rows=max(len(rows), 5),
-                        cols=max(len(rows[0]) if rows else 6, 6),
-                    )
-                if not rows:
-                    continue
-                width = max(len(r) for r in rows)
-                padded = [r + [""] * (width - len(r)) for r in rows]
-                ws.update(
-                    f"A1:{col_letter(width)}{len(padded)}",
-                    padded,
-                    value_input_option="USER_ENTERED",
-                )
-
-                header = rows[0]
-                mark_cols = [
-                    i for i, h in enumerate(header)
-                    if str(h).strip() == "Отметка" or str(h).startswith("Занятие")
-                ]
-                hide = None
-                for i, h in enumerate(header):
-                    if str(h).strip().lower() == "telegram_id":
-                        hide = i
-                if hide is not None:
-                    self._apply_formatting(ws, len(padded), mark_cols, hide)
-            return file_id
-
-        return await asyncio.to_thread(_sync)
 
 
 def quota_rows(quota: int) -> int:
