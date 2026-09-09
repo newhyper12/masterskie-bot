@@ -1,6 +1,9 @@
 # handlers/start.py
-# /start одним сообщением + постоянная нижняя кнопка «🏠 Меню» для всех устройств.
-# Фото и текст могут работать вместе.
+# /start: ОДНО приветственное сообщение:
+#   - текст/фото (можно кастомное с премиум-эмодзи),
+#   - inline-кнопки «📝 Регистрация на МК» и «📋 Мои записи»,
+#   - нижняя кнопка «🏠 Меню» под строкой ввода (reply-клавиатура).
+# Отдельного сообщения «Меню» НЕТ: нажатие «🏠 Меню» снова показывает приветствие.
 
 from __future__ import annotations
 
@@ -19,8 +22,7 @@ from texts import CONSENT_TEXT, START_TEXT
 router = Router()
 
 
-async def _send_start(message: Message, db: DB):
-    """Фото + текст вместе, если заданы оба."""
+async def _send_start(obj: Message, db: DB):
     photo = db.kv_get("START_PHOTO_ID")
     stored = db.kv_get("START_MESSAGE")
 
@@ -41,20 +43,29 @@ async def _send_start(message: Message, db: DB):
         except Exception:
             ents = None
 
+    sent = None
     if photo:
         try:
-            await message.answer_photo(
-                photo, caption=text, entities=ents, reply_markup=kb_main_reply()
+            sent = await obj.answer_photo(
+                photo, caption=text, caption_entities=ents,
+                reply_markup=kb_main_reply(),
             )
-            return
         except Exception:
-            pass
+            sent = None
+    if sent is None:
+        sent = await obj.answer(text, entities=ents, reply_markup=kb_main_reply())
 
-    await message.answer(text, entities=ents, reply_markup=kb_main_reply())
-
-
-async def _send_menu(obj):
-    await obj.answer("Меню 👇", reply_markup=kb_start())
+    # При отправке Telegram разрешает только одну клавиатуру, поэтому
+    # inline-кнопки цепляем к этому же сообщению сразу после отправки.
+    # Нижняя кнопка «🏠 Меню» при этом остаётся — она ставится в момент отправки.
+    try:
+        await obj.bot.edit_message_reply_markup(
+            chat_id=obj.chat.id,
+            message_id=sent.message_id,
+            reply_markup=kb_start(),
+        )
+    except Exception as e:
+        print(f"[start] не удалось прицепить inline-кнопки: {e}")
 
 
 @router.message(Command("start"))
@@ -62,9 +73,14 @@ async def cmd_start(message: Message, db: DB):
     await _send_start(message, db)
 
 
+# ==================================================
+# НИЖНЯЯ КЛАВИАТУРА
+# ==================================================
+
 @router.message(F.text == "🏠 Меню")
 async def msg_menu(message: Message, db: DB):
-    await _send_menu(message)
+    """Нижняя кнопка: просто показываем приветствие с кнопками заново."""
+    await _send_start(message, db)
 
 
 @router.message(F.text == "📝 Регистрация на МК")
@@ -87,6 +103,10 @@ async def require_profile_msg(message: Message, after: str, state: FSMContext, d
     await message.answer(CONSENT_TEXT, reply_markup=kb_consent())
 
 
+# ==================================================
+# INLINE-ВХОДЫ
+# ==================================================
+
 @router.callback_query(F.data == "menu:register")
 async def cb_register(callback: CallbackQuery, state: FSMContext, db: DB):
     await require_profile(callback, "register", state, db)
@@ -100,7 +120,7 @@ async def cb_my(callback: CallbackQuery, state: FSMContext, db: DB):
 @router.callback_query(F.data == "back:menu")
 async def cb_back_menu(callback: CallbackQuery, db: DB):
     await callback.answer()
-    await _send_menu(callback.message)
+    await _send_start(callback.message, db)
 
 
 async def require_profile(callback: CallbackQuery, after: str, state: FSMContext, db: DB):
