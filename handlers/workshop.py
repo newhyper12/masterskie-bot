@@ -1,5 +1,6 @@
 # handlers/workshop.py
 # Воронка записи v3: FIFO + срок 1 час, реальный статус, компактные даты.
+# Отмена освобождает строку в файле посещаемости.
 
 from __future__ import annotations
 
@@ -36,7 +37,6 @@ from texts import (
     PROMOTE_DECLINED,
     PROMOTE_EXPIRED,
     PROMOTE_OFFER,
-    PROMOTE_TIMEOUT,
     PROMOTE_YES,
     QUOTA_FULL,
     RESERVE_DONE,
@@ -48,7 +48,7 @@ from texts import (
 
 router = Router()
 
-PROMOTE_TTL_SEC = 3600
+PROMOTE_TTL_SEC = 3600  # предложение резервисту живёт 1 час
 
 
 def _slot_date(w: Workshop, slot: int) -> str:
@@ -60,6 +60,10 @@ def _slot_date(w: Workshop, slot: int) -> str:
 def _status_label(status: str) -> str:
     return {"основной": "основной набор", "резерв": "резерв"}.get(status, status)
 
+
+# ==================================================
+# ЭКРАНЫ
+# ==================================================
 
 async def show_formats(message: Message, db: DB):
     formats = db.get_formats()
@@ -97,6 +101,10 @@ async def show_my_records(message: Message, user_id: int, db: DB):
     await message.answer("\n".join(lines), reply_markup=kb_my_records(rows))
 
 
+# ==================================================
+# ЗАПИСЬ И РЕЗЕРВ
+# ==================================================
+
 async def _do_register(
     message: Message,
     profile: Profile,
@@ -122,6 +130,7 @@ async def _do_register(
         await message.answer(GOOGLE_RETRY)
         return
 
+    # В файл посещаемости попадают только «основные».
     if status == "основной" and workshop.attendance_file_id:
         try:
             await attendance.add_person(
@@ -144,7 +153,7 @@ async def _do_register(
 
 
 async def _offer_promotion(bot, db: DB, workshop: Workshop, slot: int):
-    """FIFO + срок 1 час. Если предложение старое — удаляем ключ и пробуем снова."""
+    """FIFO + срок 1 час: предложение живёт час, потом уходит следующему."""
     if db.count_active(workshop.id, slot) >= workshop.quota:
         return
     now = datetime.now().timestamp()
@@ -153,13 +162,12 @@ async def _offer_promotion(bot, db: DB, workshop: Workshop, slot: int):
         existing = db.kv_get(key)
         if existing:
             try:
-                _, ts_raw = existing.split(":", 1)
-                ts = float(ts_raw)
+                ts = float(existing.rsplit(":", 1)[1])
                 if now - ts < PROMOTE_TTL_SEC:
                     continue  # предложение ещё действует
-                db.kv_set(key, "")
             except Exception:
-                db.kv_set(key, "")
+                pass
+            db.kv_set(key, "")
         db.kv_set(key, f"{workshop.id}:{slot}:{now}")
         try:
             await bot.send_message(
@@ -173,6 +181,10 @@ async def _offer_promotion(bot, db: DB, workshop: Workshop, slot: int):
         except Exception:
             db.kv_set(key, "")
 
+
+# ==================================================
+# КАЛЛБЭКИ
+# ==================================================
 
 @router.callback_query(F.data.startswith("fmt:"))
 async def cb_format(callback: CallbackQuery, db: DB):
@@ -247,6 +259,7 @@ async def cb_signup(
         await callback.message.answer("Сначала заполни анкету.", reply_markup=kb_start())
         return
 
+    # Базовая с двумя датами — сначала выбор даты (только одной!).
     if w.format == "базовая" and w.date2:
         await callback.message.answer(
             ASK_SLOT, reply_markup=kb_slot_dates(ws_id, w.date1, w.date2)
@@ -325,6 +338,10 @@ async def cb_reserve(
     )
 
 
+# ==================================================
+# ПРЕДЛОЖЕНИЕ ПЕРЕВОДА ИЗ РЕЗЕРВА (Да / Нет, 1 час)
+# ==================================================
+
 @router.callback_query(F.data.startswith("promote:"))
 async def cb_promote(
     callback: CallbackQuery, db: DB, attendance: AttendanceClient
@@ -346,6 +363,7 @@ async def cb_promote(
         await _offer_promotion(callback.bot, db, w, rec.slot)
         return
 
+    # answer == "yes"
     if rec.status != "резерв":
         await callback.message.answer(PROMOTE_EXPIRED)
         return
@@ -370,6 +388,10 @@ async def cb_promote(
     )
 
 
+# ==================================================
+# ОТМЕНА: освобождаем строку + предлагаем место
+# ==================================================
+
 @router.callback_query(F.data.startswith("cancel:"))
 async def cb_cancel(
     callback: CallbackQuery, db: DB, attendance: AttendanceClient
@@ -391,10 +413,21 @@ async def cb_cancel(
         await show_my_records(callback.message, callback.from_user.id, db)
         return
 
+    # action == "yes"
     rec = db.get_user_record(callback.from_user.id, ws_id)
     if rec:
         db.set_record_status(rec.id, "отменено")
         db.kv_set(f"offer:{rec.id}", "")
+
+        # освобождаем строку в файле посещаемости
+        if w.attendance_file_id:
+            try:
+                await attendance.remove_person(
+                    w.attendance_file_id, w, rec.slot, rec.telegram_id
+                )
+            except Exception as e:
+                print(f"[attendance] не удалось освободить строку: {e}")
+
         await callback.message.answer(CANCEL_DONE.format(title=w.title))
         await _offer_promotion(callback.bot, db, w, rec.slot)
 

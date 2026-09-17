@@ -2,7 +2,8 @@
 # Рабочая область мастерской на Диске, v3:
 #   {корень}/«{id}. {название}»/
 #       ├── «{название} — список участников»  (регенерирует export.py из БД)
-#       └── «{название} — посещаемость»       (файл преподавателя, отметки не трогаем)
+#       └── «{название} — посещаемость»       (файл преподавателя)
+# Отменившийся освобождает строку посещаемости; следующий записавшийся занимает её.
 
 from __future__ import annotations
 
@@ -37,6 +38,10 @@ def col_letter(n: int) -> str:
     return s
 
 
+def quota_rows(quota: int) -> int:
+    return max(quota or 1, 1) + EXTRA_ROWS
+
+
 class AttendanceClient:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -49,7 +54,8 @@ class AttendanceClient:
     # ==================================================
 
     async def create_workspace(self, w: Workshop) -> tuple:
-        """Возвращает (drive_folder_id, participants_file_id, attendance_file_id)."""
+        """Возвращает (drive_folder_id, participants_file_id, attendance_file_id).
+        Если что-то падает — частично созданная папка удаляется."""
         def _sync():
             drive = user_drive(self.settings)
             sa = service_account_email(self.settings)
@@ -57,25 +63,32 @@ class AttendanceClient:
             folder_id = create_folder(
                 drive, f"{w.id}. {w.title}", self.settings.drive_folder_id
             )
-            p_id = create_spreadsheet_in_folder(
-                drive, f"{w.title} — список участников", folder_id
-            )
-            a_id = create_spreadsheet_in_folder(
-                drive, f"{w.title} — посещаемость", folder_id
-            )
-            share_with(drive, p_id, sa)
-            share_with(drive, a_id, sa)
+            try:
+                p_id = create_spreadsheet_in_folder(
+                    drive, f"{w.title} — список участников", folder_id
+                )
+                a_id = create_spreadsheet_in_folder(
+                    drive, f"{w.title} — посещаемость", folder_id
+                )
+                share_with(drive, p_id, sa)
+                share_with(drive, a_id, sa)
 
-            p_ws = self.gc.open_by_key(p_id).get_worksheet(0)
-            p_ws.update_title("Участники")
-            p_ws.update(
-                f"A1:{col_letter(len(PARTICIPANTS_HEADERS))}1",
-                [PARTICIPANTS_HEADERS],
-                value_input_option="USER_ENTERED",
-            )
+                p_ws = self.gc.open_by_key(p_id).get_worksheet(0)
+                p_ws.update_title("Участники")
+                p_ws.update(
+                    f"A1:{col_letter(len(PARTICIPANTS_HEADERS))}1",
+                    [PARTICIPANTS_HEADERS],
+                    value_input_option="USER_ENTERED",
+                )
 
-            a_sp = self.gc.open_by_key(a_id)
-            self._fill_attendance_sheets(a_sp, w, old_dump=None)
+                a_sp = self.gc.open_by_key(a_id)
+                self._fill_attendance_sheets(a_sp, w, old_dump=None)
+            except Exception:
+                try:
+                    delete_file(drive, folder_id)
+                except Exception as e:
+                    print(f"[drive] не удалось убрать сироту: {e}")
+                raise
             return folder_id, p_id, a_id
 
         return await asyncio.to_thread(_sync)
@@ -86,14 +99,23 @@ class AttendanceClient:
 
     def _fill_attendance_sheets(self, spreadsheet, w: Workshop, old_dump: dict | None):
         """Создаёт листы посещаемости; если в old_dump есть лист с таким же
-        заголовком — переносит его строки вместе с отметками."""
+        заголовком — переносит его строки вместе с отметками.
+        Имена листов гарантированно уникальны."""
         if w.format == "базовая":
             dates = [w.date1] + ([w.date2] if w.date2 else [])
             titles = [(d or f"Занятие {i + 1}")[:100] for i, d in enumerate(dates)]
         else:
             titles = ["Посещаемость"]
 
+        used = set()
         for i, title in enumerate(titles):
+            base = title
+            n = 2
+            while title in used:
+                title = f"{base} ({n})"
+                n += 1
+            used.add(title)
+
             if i == 0:
                 ws = spreadsheet.get_worksheet(0)
                 ws.update_title(title)
@@ -102,7 +124,7 @@ class AttendanceClient:
                     title=title, rows=w.quota + EXTRA_ROWS + 2, cols=8
                 )
 
-            old_rows = (old_dump or {}).get(title)
+            old_rows = (old_dump or {}).get(base) or (old_dump or {}).get(title)
             if old_rows:
                 width = max(len(r) for r in old_rows)
                 padded = [r + [""] * (width - len(r)) for r in old_rows]
@@ -234,6 +256,7 @@ class AttendanceClient:
         link: str,
         telegram_id: int,
     ) -> bool:
+        """Вписывает человека в первую пустую строку листа."""
         def _sync():
             spreadsheet = self.gc.open_by_key(file_id)
             ws = self._target_sheet(spreadsheet, w, slot)
@@ -253,8 +276,47 @@ class AttendanceClient:
 
         return await asyncio.to_thread(_sync)
 
+    async def remove_person(
+        self, file_id: str, w: Workshop, slot: int, telegram_id: int
+    ) -> bool:
+        """Освобождает строку человека: стирает ФИО, группу, ссылку, отметки
+        и telegram_id, сохраняя номер строки и формулы. Освободившуюся строку
+        займёт следующий записавшийся."""
+        def _sync():
+            spreadsheet = self.gc.open_by_key(file_id)
+            ws = self._target_sheet(spreadsheet, w, slot)
+            values = ws.get_all_values()
+            if not values:
+                return False
+            header = [str(h) for h in values[0]]
+            width = len(header)
+            hidden_idx = width - 1
+            lessons = sum(1 for h in header if h.startswith("Занятие"))
+
+            for r in range(2, len(values) + 1):
+                row = values[r - 1]
+                tid = str(row[hidden_idx]).strip() if len(row) > hidden_idx else ""
+                if tid != str(telegram_id):
+                    continue
+
+                cleared = [""] * width
+                cleared[0] = row[0] if row else ""  # сохраняем № п/п
+                if lessons:
+                    cleared[4 + lessons] = (
+                        f"=COUNTIF(E{r}:{col_letter(4 + lessons)}{r}, TRUE)"
+                    )
+                ws.update(
+                    f"A{r}:{col_letter(width)}{r}",
+                    [cleared],
+                    value_input_option="USER_ENTERED",
+                )
+                return True
+            return False
+
+        return await asyncio.to_thread(_sync)
+
     # ==================================================
-    # ДАМП / ВОССТАНОВЛЕНИЕ / ПЕРЕСБОР / УДАЛЕНИЕ
+    # ДАМП / ВОССТАНОВЛЕНИЕ / ПЕРЕСБОР / РАСШИРЕНИЕ / УДАЛЕНИЕ
     # ==================================================
 
     def dump_attendance_sync(self, file_id: str) -> dict:
@@ -327,6 +389,78 @@ class AttendanceClient:
 
         return await asyncio.to_thread(_sync)
 
+    async def resize_quota(self, w: Workshop):
+        """Дописывает недостающие строки в листы посещаемости после увеличения
+        квоты (in-place, ссылка не меняется). При уменьшении ничего не удаляет."""
+        def _sync():
+            if not w.attendance_file_id:
+                return
+            spreadsheet = self.gc.open_by_key(w.attendance_file_id)
+            need = quota_rows(w.quota)
+
+            for ws in spreadsheet.worksheets():
+                values = ws.get_all_values()
+                if not values or len(values) < 2:
+                    continue
+                header = [str(h) for h in values[0]]
+                mark_cols = [
+                    j for j, h in enumerate(header)
+                    if h.strip() == "Отметка" or h.startswith("Занятие")
+                ]
+                hide = None
+                for j, h in enumerate(header):
+                    if h.strip().lower() == "telegram_id":
+                        hide = j
+                lessons = sum(1 for h in header if h.startswith("Занятие"))
+
+                if lessons:  # специальная: есть строка ИТОГО
+                    total_idx = None
+                    for i, row in enumerate(values):
+                        if len(row) > 1 and str(row[1]).strip() == "ИТОГО":
+                            total_idx = i
+                            break
+                    if total_idx is None:
+                        continue
+                    person = values[1:total_idx]
+                    if need <= len(person):
+                        continue
+                    new_person = [list(r) for r in person]
+                    for n in range(len(person) + 1, need + 1):
+                        r = len(new_person) + 2
+                        new_person.append([
+                            n, "", "", "",
+                            *([""] * lessons),
+                            f"=COUNTIF(E{r}:{col_letter(4 + lessons)}{r}, TRUE)",
+                            "",
+                        ])
+                    person_end = len(new_person) + 1
+                    total = ["", "ИТОГО", "", ""]
+                    for c in range(5, 5 + lessons):
+                        letter = col_letter(c)
+                        total.append(f"=COUNTIF({letter}2:{letter}{person_end}, TRUE)")
+                    total += ["", ""]
+                    rows = [header] + new_person + [total]
+                else:  # базовая: только нумерованные строки
+                    person = values[1:]
+                    if need <= len(person):
+                        continue
+                    rows = [list(header)] + [list(r) for r in person]
+                    for n in range(len(person) + 1, need + 1):
+                        rows.append([n, "", "", "", "", ""])
+
+                width = max(len(r) for r in rows)
+                padded = [list(r) + [""] * (width - len(r)) for r in rows]
+                ws.clear()
+                ws.update(
+                    f"A1:{col_letter(width)}{len(padded)}",
+                    padded,
+                    value_input_option="USER_ENTERED",
+                )
+                if hide is not None:
+                    self._apply_formatting(ws, len(padded), mark_cols, hide)
+
+        await asyncio.to_thread(_sync)
+
     async def delete_workspace(self, w: Workshop):
         """Удаляет папку мастерской вместе с обоими файлами."""
         def _sync():
@@ -345,7 +479,3 @@ class AttendanceClient:
                         pass
 
         await asyncio.to_thread(_sync)
-
-
-def quota_rows(quota: int) -> int:
-    return max(quota or 1, 1) + EXTRA_ROWS
