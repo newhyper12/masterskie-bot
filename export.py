@@ -1,8 +1,8 @@
 # export.py
-# v3: у каждой мастерской свой файл «список участников», который раз в минуту
-# пересоздаётся из БД. Служебные колонки (по заголовкам) — перезаписываются,
-# пользовательские (без заголовков из PARTICIPANTS_HEADERS) — сохраняются.
-# Статусы ровно три: Активный / Резерв / Отменился.
+# Авто-выгрузки (планировщик, раз в минуту):
+#   1) файл «{название} — список участников» каждой мастерской;
+#   2) общий отчёт «Мастерские — зарегистрированные люди» (уникальные люди,
+#      с датой рождения). Таблица создаётся автоматически при первом цикле.
 
 from __future__ import annotations
 
@@ -13,6 +13,15 @@ import gspread
 from attendance import PARTICIPANTS_HEADERS, col_letter
 from config import Settings
 from db import DB
+from google_drive import (
+    create_spreadsheet_in_folder,
+    service_account_email,
+    share_with,
+    user_drive,
+)
+
+PEOPLE_TITLE = "Мастерские — зарегистрированные люди"
+PEOPLE_KV_KEY = "DUMP_PEOPLE_SPREADSHEET_ID"
 
 STATUS_MAP = {
     "основной": "Активный",
@@ -20,16 +29,18 @@ STATUS_MAP = {
     "отменено": "Отменился",
     "отчислен": "Отменился",
 }
-STATUS_ORDER = {"Активный": 0, "Резерв": 1, "Отменился": 2}
+
+PEOPLE_HEADERS = [
+    "telegram_id", "ФИО", "Группа", "Дата рождения",
+    "Телефон", "Почта", "Контакт", "Дата регистрации", "Записей на МК",
+]
 
 
 class ExportClient:
     def __init__(self, settings: Settings, db: DB):
-        self.db = db
         self.settings = settings
-        self.gc = gspread.service_account(
-            filename=str(settings.service_account_file)
-        )
+        self.db = db
+        self.gc = gspread.service_account(filename=str(settings.service_account_file))
 
     async def export_all(self):
         await asyncio.to_thread(self._sync_export)
@@ -39,25 +50,28 @@ class ExportClient:
             if not w.participants_file_id:
                 continue
             try:
-                self._sync_one(w)
+                self._export_workshop(w)
             except Exception as e:
                 print(f"[export] мастерская {w.id}: {e}")
+        try:
+            self._export_people()
+        except Exception as e:
+            print(f"[export] отчёт людей: {e}")
 
-    def _sync_one(self, w):
-        records = [r for r in self.db.all_records() if r.workshop_id == w.id]
-        records.sort(
-            key=lambda r: (
-                STATUS_ORDER.get(STATUS_MAP.get(r.status, "Отменился"), 3), r.id
-            )
-        )
+    # --------------------------------------------------
+    # файл участников мастерской
+    # --------------------------------------------------
 
+    def _export_workshop(self, w):
         rows = [PARTICIPANTS_HEADERS]
+        records = self.db.get_workshop_records(
+            w.id, ["основной", "резерв", "отменено"]
+        )
         for r in records:
             p = self.db.get_profile(r.telegram_id)
-            if w.format == "базовая":
-                date = w.date1 if r.slot == 1 else (w.date2 or w.date1)
-            else:
-                date = w.date1
+            date = w.date1
+            if w.format == "базовая" and r.slot == 2:
+                date = w.date2 or w.date1
             rows.append([
                 r.telegram_id,
                 p.full_name if p else "",
@@ -69,42 +83,67 @@ class ExportClient:
                 STATUS_MAP.get(r.status, r.status),
                 r.created_at,
             ])
-
         ws = self.gc.open_by_key(w.participants_file_id).worksheet("Участники")
-        existing = ws.get_all_values()
-        header_idx = {h: i for i, h in enumerate(PARTICIPANTS_HEADERS)}
-        user_cols = []
-        if existing:
-            first_row = existing[0]
-            for i, cell in enumerate(first_row):
-                if cell.strip() and cell not in header_idx:
-                    user_cols.append(i)
-
-        if user_cols and len(existing) > 1:
-            saved = {}
-            for r in existing[1:]:
-                key = ""
-                if len(r) > header_idx["telegram_id"]:
-                    key = str(r[header_idx["telegram_id"]]).strip()
-                if not key:
-                    continue
-                saved[key] = [r[i] if i < len(r) else "" for i in user_cols]
-            for row in rows[1:]:
-                key = str(row[0]).strip()
-                extras = saved.get(key, [""] * len(user_cols))
-                for idx, col in enumerate(user_cols):
-                    while len(row) <= col:
-                        row.append("")
-                    row[col] = extras[idx] if idx < len(extras) else ""
-
-        width = max(
-            len(rows[0]),
-            max(len(r) for r in rows) if len(rows) > 1 else 0,
-        )
-        padded = [r + [""] * (width - len(r)) for r in rows]
         ws.clear()
+        width = len(PARTICIPANTS_HEADERS)
         ws.update(
-            f"A1:{col_letter(width)}{len(padded)}",
-            padded,
+            f"A1:{col_letter(width)}{max(len(rows), 1)}",
+            rows,
+            value_input_option="USER_ENTERED",
+        )
+
+    # --------------------------------------------------
+    # общий отчёт уникальных людей
+    # --------------------------------------------------
+
+    def _people_sheet_id(self) -> str:
+        sid = self.db.kv_get(PEOPLE_KV_KEY)
+        if sid:
+            try:
+                self.gc.open_by_key(sid)
+                return sid
+            except Exception:
+                print(f"[export] таблица людей {sid} не найдена, создаю заново")
+        drive = user_drive(self.settings)
+        sa = service_account_email(self.settings)
+        sid = create_spreadsheet_in_folder(
+            drive, PEOPLE_TITLE, self.settings.drive_folder_id
+        )
+        share_with(drive, sid, sa)
+        self.db.kv_set(PEOPLE_KV_KEY, sid)
+        return sid
+
+    def _export_people(self):
+        sid = self._people_sheet_id()
+
+        count_by_user = {}
+        for r in self.db.all_records():
+            if r.status in ("основной", "резерв"):
+                count_by_user[r.telegram_id] = count_by_user.get(r.telegram_id, 0) + 1
+
+        rows = [PEOPLE_HEADERS]
+        for p in self.db.get_all_profiles():
+            rows.append([
+                p.telegram_id,
+                p.full_name,
+                p.group,
+                p.birth_date or "",
+                p.phone,
+                p.email,
+                p.nickname,
+                p.updated_at,
+                count_by_user.get(p.telegram_id, 0),
+            ])
+
+        ws = self.gc.open_by_key(sid).get_worksheet(0)
+        try:
+            ws.update_title("Люди")
+        except Exception:
+            pass
+        ws.clear()
+        width = len(PEOPLE_HEADERS)
+        ws.update(
+            f"A1:{col_letter(width)}{max(len(rows), 1)}",
+            rows,
             value_input_option="USER_ENTERED",
         )

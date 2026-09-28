@@ -1,7 +1,6 @@
 # handlers/admin.py
-# Админ-панель v3: создание рабочей области (папка + 2 файла), расписание,
-# редактирование (без квоты, с пересбором посещаемости при правке дат),
-# удаление с бэкапом и удалением папки, восстановление, фото, напоминания.
+# Админ-панель v4: мастерские, расписание, редактирование с квотой,
+# удаление/восстановление, фото, напоминания + НОВОЕ: рассылка всем.
 
 from __future__ import annotations
 
@@ -26,6 +25,7 @@ from keyboards import (
     kb_admin_open_now,
     kb_admin_skip,
     kb_admin_workshops,
+    kb_birth_button,
     kb_confirm_delete,
     kb_confirm_restore,
     kb_format_photo_pick,
@@ -33,6 +33,7 @@ from keyboards import (
 from models import Workshop
 from scheduler import Scheduler
 from states import (
+    AdminBroadcastStates,
     AdminEditStates,
     AdminReminderStates,
     AdminScheduleStates,
@@ -60,6 +61,8 @@ from texts import (
     ADMIN_PHOTO_SET,
     ADMIN_SCHEDULE_SAVED,
     ADMIN_WORKSHOP_CREATED,
+    BROADCAST_ASK_TEXT,
+    BROADCAST_DONE,
     DELETE_CONFIRM,
     DELETE_DONE,
     DELETE_PICK,
@@ -85,6 +88,7 @@ EDIT_LABELS = {
     "date1": "дата 1",
     "date2": "дата 2",
     "location": "место",
+    "quota": "квота",
 }
 
 
@@ -100,7 +104,6 @@ def _parse_dt(value: str) -> datetime | None:
 
 
 def _parse_workshop_date(value: str) -> str | None:
-    """Принимает ДД.ММ.ГГГГ или ДД.ММ.ГГГГ ЧЧ:ММ, возвращает нормализованную строку."""
     value = (value or "").strip()
     if not value:
         return None
@@ -132,6 +135,44 @@ async def cb_admin_menu(callback: CallbackQuery, settings: Settings):
         return
     await callback.answer()
     await callback.message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
+
+
+# ==================================================
+# НОВОЕ: РАССЫЛКА ВСЕМ ЗАРЕГИСТРИРОВАННЫМ
+# ==================================================
+
+@router.callback_query(F.data == "admin:broadcast")
+async def cb_admin_broadcast(
+    callback: CallbackQuery, state: FSMContext, settings: Settings
+):
+    if not _is_admin(callback.from_user.id, settings):
+        return
+    await callback.answer()
+    await state.set_state(AdminBroadcastStates.text)
+    await callback.message.answer(BROADCAST_ASK_TEXT)
+
+
+@router.message(AdminBroadcastStates.text)
+async def st_broadcast_text(message: Message, state: FSMContext, db: DB):
+    body = (message.text or "").strip()
+    if not body:
+        await message.answer(BROADCAST_ASK_TEXT)
+        return
+    await state.clear()
+
+    profiles = db.get_all_profiles()
+    sent = 0
+    for p in profiles:
+        try:
+            await message.bot.send_message(
+                p.telegram_id, body, reply_markup=kb_birth_button()
+            )
+            sent += 1
+        except Exception:
+            continue
+
+    await message.answer(BROADCAST_DONE.format(sent=sent, total=len(profiles)))
+    await message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
 
 
 # ==================================================
@@ -199,6 +240,10 @@ async def st_date2(message: Message, state: FSMContext):
         parsed = _parse_workshop_date(value)
         if parsed is None:
             await message.answer(ADMIN_BAD_DATE)
+            return
+        data = await state.get_data()
+        if parsed == data.get("date1"):
+            await message.answer("Вторая дата совпадает с первой. Введи другую дату или «Нет».")
             return
         value = parsed
     await state.update_data(date2=value)
@@ -380,9 +425,7 @@ async def _finish_create(obj: Message, state: FSMContext, db: DB, attendance: At
     await state.clear()
 
     await obj.answer(
-        ADMIN_WORKSHOP_CREATED.format(
-            title=workshop.title, open_at=open_iso or "сейчас"
-        )
+        ADMIN_WORKSHOP_CREATED.format(title=workshop.title, open_at=open_iso or "сейчас")
     )
     await obj.answer(
         "📄 Список участников:\n"
@@ -484,7 +527,7 @@ async def _finish_schedule(obj: Message, state: FSMContext, db: DB, close_iso: s
 
 
 # ==================================================
-# РЕДАКТИРОВАНИЕ (без квоты; правка дат пересобирает посещаемость)
+# РЕДАКТИРОВАНИЕ
 # ==================================================
 
 @router.callback_query(F.data == "admin:edit")
@@ -522,9 +565,26 @@ async def cb_editf(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer(EDIT_ASK_PHOTO)
     else:
         await state.set_state(AdminEditStates.value)
-        await callback.message.answer(
-            EDIT_ASK_VALUE.format(field=EDIT_LABELS.get(field, field))
-        )
+        await callback.message.answer(EDIT_ASK_VALUE.format(field=EDIT_LABELS[field]))
+
+
+@router.message(AdminEditStates.photo, F.photo)
+async def st_edit_photo(message: Message, state: FSMContext, db: DB):
+    data = await state.get_data()
+    ws_id = data.get("edit_ws")
+    db.update_workshop(ws_id, photo=message.photo[-1].file_id)
+    await state.clear()
+    await message.answer(EDIT_DONE)
+    w = db.get_workshop(ws_id)
+    await message.answer(
+        EDIT_PICK.format(title=w.title if w else ws_id),
+        reply_markup=kb_admin_edit_fields(ws_id),
+    )
+
+
+@router.message(AdminEditStates.photo)
+async def st_edit_photo_fallback(message: Message):
+    await message.answer("Пришли фото картинкой.")
 
 
 @router.message(AdminEditStates.value)
@@ -536,7 +596,28 @@ async def st_edit_value(
     ws_id = data.get("edit_ws")
     value = (message.text or "").strip()
 
-    if field in ("date1", "date2"):
+    if field == "quota":
+        if not value.isdigit() or int(value) < 1:
+            await message.answer("Нужно положительное число.")
+            return
+        new_quota = int(value)
+        db.update_workshop(ws_id, quota=new_quota)
+
+        busy = max(db.count_active(ws_id, 1), db.count_active(ws_id, 2))
+        if new_quota < busy:
+            await message.answer(
+                f"⚠️ Новая квота {new_quota} меньше уже записанных ({busy}). "
+                "Существующие участники останутся, но новые места не появятся, "
+                "пока кто-то не отменит запись."
+            )
+        else:
+            fresh = db.get_workshop(ws_id)
+            if fresh and fresh.attendance_file_id:
+                try:
+                    await attendance.resize_quota(fresh)
+                except Exception as e:
+                    print(f"[admin] не удалось расширить файл посещаемости: {e}")
+    elif field in ("date1", "date2"):
         if field == "date2" and value.lower() in ("нет", "-", "не", "no"):
             db.update_workshop(ws_id, date2="")
         else:
@@ -544,9 +625,13 @@ async def st_edit_value(
             if parsed is None:
                 await message.answer(ADMIN_BAD_DATE)
                 return
+            fresh = db.get_workshop(ws_id)
+            other = fresh.date2 if field == "date1" else fresh.date1
+            if parsed == other and other:
+                await message.answer("Даты не могут совпадать. Введи другую.")
+                return
             db.update_workshop(ws_id, **{field: parsed})
 
-        # даты изменились — пересобираем файл посещаемости, сохраняя отметки
         fresh = db.get_workshop(ws_id)
         if fresh and fresh.attendance_file_id:
             try:
@@ -566,22 +651,8 @@ async def st_edit_value(
     )
 
 
-@router.message(AdminEditStates.photo, F.photo)
-async def st_edit_photo(message: Message, state: FSMContext, db: DB):
-    data = await state.get_data()
-    ws_id = data.get("edit_ws")
-    db.update_workshop(ws_id, photo=message.photo[-1].file_id)
-    await state.clear()
-    await message.answer(EDIT_DONE)
-    w = db.get_workshop(ws_id)
-    await message.answer(
-        EDIT_PICK.format(title=w.title if w else ws_id),
-        reply_markup=kb_admin_edit_fields(ws_id),
-    )
-
-
 # ==================================================
-# УДАЛЕНИЕ И ВОССТАНОВЛЕНИЕ
+# УДАЛЕНИЕ / ВОССТАНОВЛЕНИЕ
 # ==================================================
 
 @router.callback_query(F.data == "admin:delete")
@@ -590,57 +661,57 @@ async def cb_admin_delete(callback: CallbackQuery, db: DB, settings: Settings):
         return
     await callback.answer()
     workshops = db.get_workshops()
+    if not workshops:
+        await callback.message.answer("Нет активных мастерских.")
+        return
     await callback.message.answer(
-        DELETE_PICK, reply_markup=kb_admin_workshops(workshops, "del")
+        DELETE_PICK, reply_markup=kb_admin_workshops(workshops, "delws")
+    )
+
+
+@router.callback_query(F.data.startswith("delws:"))
+async def cb_delws(callback: CallbackQuery, state: FSMContext, db: DB):
+    await callback.answer()
+    ws_id = int(callback.data.split(":")[1])
+    await state.update_data(del_ws=ws_id)
+    w = db.get_workshop(ws_id)
+    await callback.message.answer(
+        DELETE_CONFIRM.format(title=w.title if w else ws_id),
+        reply_markup=kb_confirm_delete(ws_id),
     )
 
 
 @router.callback_query(F.data.startswith("del:"))
 async def cb_del(
-    callback: CallbackQuery,
-    db: DB,
-    attendance: AttendanceClient,
-    scheduler: Scheduler,
+    callback: CallbackQuery, state: FSMContext, db: DB, attendance: AttendanceClient
 ):
     await callback.answer()
-    parts = callback.data.split(":")
-
-    # выбрали мастерскую из списка — показываем подтверждение
-    if len(parts) == 2:
-        ws_id = int(parts[1])
-        w = db.get_workshop(ws_id)
-        if not w:
-            return
-        await callback.message.answer(
-            DELETE_CONFIRM.format(title=w.title),
-            reply_markup=kb_confirm_delete(ws_id),
-        )
+    _, answer, ws_raw = callback.data.split(":")
+    ws_id = int(ws_raw)
+    await state.clear()
+    if answer == "no":
+        await callback.message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
         return
 
-    _, action, ws_raw = parts
-    ws_id = int(ws_raw)
     w = db.get_workshop(ws_id)
     if not w:
         return
 
-    if action == "no":
-        await callback.message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
-        return
-
-    # свежий бэкап перед удалением
-    try:
-        await scheduler.backup_one(ws_id)
-    except Exception as e:
-        print(f"[backup] ошибка перед удалением: {e}")
-
-    # удаляем папку мастерской вместе с обоими файлами
-    if w.drive_folder_id or w.attendance_file_id or w.participants_file_id:
+    dump = None
+    if w.attendance_file_id:
         try:
-            await attendance.delete_workspace(w)
+            dump = await attendance.dump_attendance(w.attendance_file_id)
         except Exception as e:
-            print(f"[drive] не удалось удалить рабочую область: {e}")
+            print(f"[admin] дамп перед удалением не снялся: {e}")
+    if dump:
+        db.save_backup(ws_id, dump)
 
     db.update_workshop(ws_id, deleted=True, is_open=False)
+    try:
+        await attendance.delete_workspace(w)
+    except Exception as e:
+        print(f"[admin] не удалось удалить рабочую область: {e}")
+
     await callback.message.answer(DELETE_DONE.format(title=w.title))
     await callback.message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
 
@@ -650,73 +721,39 @@ async def cb_admin_restore(callback: CallbackQuery, db: DB, settings: Settings):
     if not _is_admin(callback.from_user.id, settings):
         return
     await callback.answer()
-    deleted = [
-        w for w in db.get_workshops_raw(include_deleted=True)
-        if w.deleted and db.has_backups(w.id)
-    ]
+    deleted = db.get_workshops(include_deleted=True)
+    deleted = [w for w in deleted if w.deleted]
     if not deleted:
         await callback.message.answer(RESTORE_NONE)
         return
     await callback.message.answer(
-        RESTORE_PICK, reply_markup=kb_admin_workshops(deleted, "rest")
+        RESTORE_PICK, reply_markup=kb_admin_workshops(deleted, "restws")
     )
 
 
-@router.callback_query(F.data.startswith("rest:"))
-async def cb_rest(
-    callback: CallbackQuery, db: DB, attendance: AttendanceClient
-):
+@router.callback_query(F.data.startswith("restws:"))
+async def cb_restws(callback: CallbackQuery, db: DB, attendance: AttendanceClient):
     await callback.answer()
-    parts = callback.data.split(":")
-
-    # выбрали мастерскую из списка — показываем подтверждение
-    if len(parts) == 2:
-        ws_id = int(parts[1])
-        w = db.get_workshop(ws_id)
-        if not w:
-            return
-        await callback.message.answer(
-            f"Восстановить «{w.title}» из последней резервной копии?",
-            reply_markup=kb_confirm_restore(ws_id),
-        )
-        return
-
-    _, action, ws_raw = parts
-    ws_id = int(ws_raw)
+    ws_id = int(callback.data.split(":")[1])
     w = db.get_workshop(ws_id)
     if not w:
         return
 
-    if action == "no":
-        await callback.message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
-        return
-
-    backup = db.latest_backup(ws_id)
-    dump = backup.get("attendance") if backup else None
-    try:
-        folder_id, p_id, a_id = await attendance.restore_workspace(w, dump)
-        db.update_workshop(
-            ws_id,
-            deleted=False,
-            drive_folder_id=folder_id,
-            participants_file_id=p_id,
-            attendance_file_id=a_id,
-        )
-        await callback.message.answer(RESTORE_DONE.format(title=w.title))
-        await callback.message.answer(
-            "📄 Список участников:\n"
-            f"https://docs.google.com/spreadsheets/d/{p_id}\n\n"
-            "📄 Файл посещаемости:\n"
-            f"https://docs.google.com/spreadsheets/d/{a_id}"
-        )
-    except Exception as e:
-        await callback.message.answer(f"⚠️ Не удалось восстановить: {str(e)[:200]}")
-
+    dump = db.latest_backup(ws_id)
+    folder_id, p_id, a_id = await attendance.restore_workspace(w, dump)
+    db.update_workshop(
+        ws_id,
+        deleted=False,
+        drive_folder_id=folder_id,
+        participants_file_id=p_id,
+        attendance_file_id=a_id,
+    )
+    await callback.message.answer(RESTORE_DONE.format(title=w.title))
     await callback.message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
 
 
 # ==================================================
-# ФОТО ФОРМАТОВ / ПРИВЕТСТВИЯ / ТЕКСТ ПРИВЕТСТВИЯ
+# ФОТО ФОРМАТОВ / ПРИВЕТСТВИЕ
 # ==================================================
 
 @router.callback_query(F.data == "admin:fmtphoto")
@@ -724,24 +761,30 @@ async def cb_admin_fmtphoto(callback: CallbackQuery, state: FSMContext, settings
     if not _is_admin(callback.from_user.id, settings):
         return
     await callback.answer()
+    await state.set_state(AdminServiceStates.format_photo)
     await callback.message.answer(FORMAT_PHOTO_PICK, reply_markup=kb_format_photo_pick())
 
 
-@router.callback_query(F.data.startswith("fmtphoto:"))
-async def cb_fmtphoto_format(callback: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("fmtphoto:"), AdminServiceStates.format_photo)
+async def cb_fmtphoto_pick(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.update_data(fmt_name=callback.data.split(":", 1)[1])
-    await state.set_state(AdminServiceStates.format_photo)
-    await callback.message.answer("Пришли фото для этого формата.")
+    await callback.message.answer("Пришли фото картинкой.")
 
 
 @router.message(AdminServiceStates.format_photo, F.photo)
-async def st_format_photo(message: Message, state: FSMContext, db: DB):
+async def st_fmt_photo(message: Message, state: FSMContext, db: DB):
     data = await state.get_data()
     name = data.get("fmt_name", "базовая")
     db.set_format_photo(name, message.photo[-1].file_id)
     await state.clear()
     await message.answer(FORMAT_PHOTO_SET.format(name=name))
+    await message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
+
+
+@router.message(AdminServiceStates.format_photo)
+async def st_fmt_photo_fallback(message: Message):
+    await message.answer("Пришли фото картинкой.")
 
 
 @router.callback_query(F.data == "admin:setphoto")
@@ -754,10 +797,16 @@ async def cb_admin_setphoto(callback: CallbackQuery, state: FSMContext, settings
 
 
 @router.message(AdminServiceStates.start_photo, F.photo)
-async def st_setphoto(message: Message, state: FSMContext, db: DB):
+async def st_start_photo(message: Message, state: FSMContext, db: DB):
     db.kv_set("START_PHOTO_ID", message.photo[-1].file_id)
     await state.clear()
     await message.answer(ADMIN_PHOTO_SET)
+    await message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
+
+
+@router.message(AdminServiceStates.start_photo)
+async def st_start_photo_fallback(message: Message):
+    await message.answer("Пришли фото картинкой.")
 
 
 @router.callback_query(F.data == "admin:settext")
@@ -770,23 +819,15 @@ async def cb_admin_settext(callback: CallbackQuery, state: FSMContext, settings:
 
 
 @router.message(AdminServiceStates.start_text)
-async def st_settext(message: Message, state: FSMContext, db: DB):
-    """
-    Сохраняем текст ВМЕСТЕ с entities — так премиум-эмодзи,
-    вставленные тобой, сохраняются и отображаются у пользователей.
-    """
-    keep = []
-    for e in (message.entities or []):
-        if e.type in ("custom_emoji", "bold", "italic", "underline"):
-            d = {"type": e.type, "offset": e.offset, "length": e.length}
-            if e.type == "custom_emoji":
-                d["custom_emoji_id"] = e.custom_emoji_id
-            keep.append(d)
-    db.kv_set("START_MESSAGE", json.dumps(
-        {"text": message.text or "", "entities": keep}, ensure_ascii=False
-    ))
+async def st_start_text(message: Message, state: FSMContext, db: DB):
+    payload = {
+        "text": message.text or message.caption or "",
+        "entities": [e.model_dump() for e in (message.entities or message.caption_entities or [])],
+    }
+    db.kv_set("START_MESSAGE", json.dumps(payload, ensure_ascii=False))
     await state.clear()
     await message.answer(START_TEXT_SET)
+    await message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
 
 
 # ==================================================
@@ -794,76 +835,47 @@ async def st_settext(message: Message, state: FSMContext, db: DB):
 # ==================================================
 
 @router.callback_query(F.data == "admin:remind")
-async def cb_admin_remind(callback: CallbackQuery, db: DB, settings: Settings):
+async def cb_admin_remind(callback: CallbackQuery, state: FSMContext, settings: Settings):
     if not _is_admin(callback.from_user.id, settings):
         return
     await callback.answer()
-    workshops = db.get_workshops()
-    await callback.message.answer(
-        "По какой мастерской напомнить?",
-        reply_markup=kb_admin_workshops(workshops, "remindws"),
-    )
-
-
-@router.callback_query(F.data.startswith("remindws:"))
-async def cb_remind_ws(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
     await state.set_state(AdminReminderStates.audience)
-    await state.update_data(remind_ws=int(callback.data.split(":")[1]))
-    await callback.message.answer("Кому отправить?", reply_markup=kb_admin_audience())
+    await callback.message.answer("Кому напомнить?", reply_markup=kb_admin_audience())
 
 
 @router.callback_query(F.data.startswith("aud:"), AdminReminderStates.audience)
-async def cb_audience(callback: CallbackQuery, state: FSMContext):
+async def cb_aud(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    await state.update_data(audience=callback.data.split(":", 1)[1])
+    await state.update_data(aud=callback.data.split(":", 1)[1])
     await state.set_state(AdminReminderStates.text)
     await callback.message.answer(ADMIN_ASK_REMINDER_TEXT)
 
 
 @router.message(AdminReminderStates.text)
-async def st_reminder_text(message: Message, state: FSMContext, db: DB):
+async def st_remind_text(message: Message, state: FSMContext, db: DB):
     data = await state.get_data()
-    ws_id = data.get("remind_ws")
-    audience = data.get("audience", "все")
+    aud = data.get("aud", "все")
     body = (message.text or "").strip()
-
-    w = db.get_workshop(ws_id)
-    if not w:
-        await state.clear()
-        await message.answer("Мастерская не найдена.")
+    await state.clear()
+    if not body:
+        await message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
         return
 
-    if audience == "основной":
-        statuses = ["основной"]
-    elif audience == "резерв":
-        statuses = ["резерв"]
-    else:
-        statuses = ["основной", "резерв"]
+    targets = set()
+    for w in db.get_workshops(include_deleted=True):
+        statuses = ["основной"] if aud == "основной" else (
+            ["резерв"] if aud == "резерв" else ["основной", "резерв"]
+        )
+        for r in db.get_workshop_records(w.id, statuses):
+            targets.add(r.telegram_id)
 
     sent = 0
-    for rec in db.get_workshop_records(ws_id, statuses):
+    for tid in targets:
         try:
-            await message.bot.send_message(
-                rec.telegram_id, reminder_text(w.title, body), parse_mode="HTML"
-            )
+            await message.bot.send_message(tid, reminder_text(body))
             sent += 1
         except Exception:
             continue
 
-    await state.clear()
-    await message.answer(REMINDER_SENT.format(count=sent))
+    await message.answer(REMINDER_SENT.format(sent=sent, total=len(targets)))
     await message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
-
-
-# ==================================================
-# УТИЛИТА: file_id для фото вне состояний
-# ==================================================
-
-@router.message(F.photo)
-async def photo_file_id_utility(message: Message, settings: Settings):
-    if not _is_admin(message.from_user.id, settings):
-        return
-    await message.answer(
-        f"file_id этого фото:\n<code>{message.photo[-1].file_id}</code>"
-    )

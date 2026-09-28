@@ -1,5 +1,5 @@
 # keyboards.py
-# Все клавиатуры бота, версия 3.
+# Все клавиатуры бота.
 
 from __future__ import annotations
 
@@ -28,9 +28,12 @@ def _short_date(d: str) -> str:
 # ==================================================
 
 def kb_main_reply() -> ReplyKeyboardMarkup:
-    """Постоянная нижняя кнопка меню — видна на всех устройствах."""
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="🏠 Меню")]],
+        keyboard=[
+            [KeyboardButton(text="📝 Регистрация на МК"),
+             KeyboardButton(text="📋 Мои записи")],
+            [KeyboardButton(text="🏠 Меню")],
+        ],
         resize_keyboard=True,
     )
 
@@ -50,7 +53,6 @@ def kb_consent() -> Markup:
 
 
 def kb_contact_type() -> Markup:
-    """Куда писать: Telegram или VK."""
     return Markup(inline_keyboard=[
         [KB(text="✈️ Telegram", callback_data="contact:tg")],
         [KB(text="💙 VK", callback_data="contact:vk")],
@@ -58,7 +60,6 @@ def kb_contact_type() -> Markup:
 
 
 def kb_confirm() -> Markup:
-    """Подтверждение анкеты."""
     return Markup(inline_keyboard=[
         [KB(text="✅ Всё верно", callback_data="confirm:yes")],
         [KB(text="✏️ Изменить", callback_data="confirm:edit")],
@@ -66,7 +67,6 @@ def kb_confirm() -> Markup:
 
 
 def kb_edit_fields() -> Markup:
-    """Какое поле анкеты исправить."""
     return Markup(inline_keyboard=[
         [KB(text="ФИО", callback_data="edit:full_name"),
          KB(text="Группа", callback_data="edit:group")],
@@ -74,6 +74,13 @@ def kb_edit_fields() -> Markup:
          KB(text="Почта", callback_data="edit:email")],
         [KB(text="Контакт", callback_data="edit:nickname")],
         [KB(text="↩️ Назад", callback_data="edit:back")],
+    ])
+
+
+def kb_birth_button() -> Markup:
+    """НОВОЕ: кнопка сбора даты рождения — крепится к рассылке."""
+    return Markup(inline_keyboard=[
+        [KB(text="🎂 Указать дату рождения", callback_data="birth:set")],
     ])
 
 
@@ -101,7 +108,6 @@ def kb_workshop_card(workshop_id: int) -> Markup:
 
 
 def kb_slot_dates(workshop_id: int, date1: str, date2: str) -> Markup:
-    """Выбор даты для базовой мастерской (записаться можно только на одну)."""
     return Markup(inline_keyboard=[
         [KB(text=f"📅 {_short_date(date1)}", callback_data=f"slot:1:{workshop_id}")],
         [KB(text=f"📅 {_short_date(date2)}", callback_data=f"slot:2:{workshop_id}")],
@@ -133,7 +139,6 @@ def kb_cancel_confirm(workshop_id: int) -> Markup:
 
 
 def kb_promote_offer(record_id: int) -> Markup:
-    """Предложение резервисту перейти в основу (Да/Нет, срок 1 час)."""
     return Markup(inline_keyboard=[
         [KB(text="Да", callback_data=f"promote:yes:{record_id}"),
          KB(text="Нет", callback_data=f"promote:no:{record_id}")],
@@ -151,10 +156,11 @@ def kb_admin_menu() -> Markup:
         [KB(text="✏️ Редактировать", callback_data="admin:edit")],
         [KB(text="🗑 Удалить", callback_data="admin:delete"),
          KB(text="♻️ Восстановить", callback_data="admin:restore")],
+        [KB(text=" Напоминания", callback_data="admin:remind")],
+        [KB(text="📨 Рассылка всем", callback_data="admin:broadcast")],
         [KB(text="🖼 Фото форматов", callback_data="admin:fmtphoto")],
         [KB(text="📸 Фото приветствия", callback_data="admin:setphoto"),
          KB(text="✍️ Текст приветствия", callback_data="admin:settext")],
-        [KB(text="📣 Напоминания", callback_data="admin:remind")],
     ])
 
 
@@ -193,13 +199,13 @@ def kb_admin_workshops(workshops, prefix: str) -> Markup:
 
 
 def kb_admin_edit_fields(workshop_id: int) -> Markup:
-    """Поля редактирования. Квоты здесь НЕТ — она задаётся только при создании."""
     fields = [
         ("title", "Название"),
         ("description", "Описание"),
         ("date1", "Дата 1"),
         ("date2", "Дата 2"),
         ("location", "Место"),
+        ("quota", "Квота (мест)"),
         ("photo", "Фото"),
     ]
     rows = [

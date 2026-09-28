@@ -1,5 +1,6 @@
 # handlers/survey.py
-# Анкета пользователя при первом запуске (согласие 152-ФЗ + данные).
+# Анкета пользователя при первом запуске (согласие 152-ФЗ + данные)
+# + сбор даты рождения по кнопке из рассылки.
 
 from __future__ import annotations
 
@@ -18,12 +19,15 @@ from keyboards import (
 from models import Profile
 from states import SurveyStates
 from texts import (
+    ASK_BIRTH_DATE,
     ASK_EMAIL,
     ASK_FULL_NAME,
     ASK_GROUP,
     ASK_NICKNAME,
     ASK_PHONE,
-    EDIT_ASK_VALUE, 
+    BIRTH_BAD,
+    BIRTH_SAVED,
+    EDIT_ASK_VALUE,
     profile_confirm_text,
 )
 from handlers.start import route_after
@@ -39,6 +43,18 @@ FIELD_LABELS = {
 }
 
 
+def _parse_birth_date(value: str) -> str | None:
+    """Принимает ДД.ММ.ГГГГ (или ДД.ММ.ГГ), возвращает ДД.ММ.ГГГГ или None."""
+    value = (value or "").strip()
+    for fmt in ("%d.%m.%Y", "%d.%m.%y"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            return dt.strftime("%d.%m.%Y")
+        except ValueError:
+            continue
+    return None
+
+
 @router.callback_query(F.data == "consent:yes", SurveyStates.consent)
 async def cb_consent(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -49,7 +65,11 @@ async def cb_consent(callback: CallbackQuery, state: FSMContext):
 
 @router.message(SurveyStates.full_name)
 async def st_full_name(message: Message, state: FSMContext):
-    await state.update_data(full_name=(message.text or "").strip())
+    value = (message.text or "").strip()
+    if len(value.split()) < 3:
+        await message.answer("Укажи полностью: Фамилия Имя Отчество (три слова).")
+        return
+    await state.update_data(full_name=value)
     await state.set_state(SurveyStates.group)
     await message.answer(ASK_GROUP)
 
@@ -72,7 +92,7 @@ async def st_phone(message: Message, state: FSMContext):
 async def st_email(message: Message, state: FSMContext):
     await state.update_data(email=(message.text or "").strip())
     await state.set_state(SurveyStates.contact_type)
-    await message.answer(ASK_NICKNAME.replace("Контакт", "Куда писать") if False else "Куда писать: Telegram или VK?", reply_markup=kb_contact_type())
+    await message.answer("Куда писать: Telegram или VK?", reply_markup=kb_contact_type())
 
 
 @router.callback_query(F.data.startswith("contact:"), SurveyStates.contact_type)
@@ -140,6 +160,37 @@ async def cb_confirm_yes(callback: CallbackQuery, state: FSMContext, db: DB):
     await route_after(callback.message, after, db, callback.from_user.id)
 
 
+# ==================================================
+# НОВОЕ: СБОР ДАТЫ РОЖДЕНИЯ (кнопка в рассылке)
+# ==================================================
+
+@router.callback_query(F.data == "birth:set")
+async def cb_birth_set(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(SurveyStates.birth_date)
+    await callback.message.answer(ASK_BIRTH_DATE)
+
+
+@router.message(SurveyStates.birth_date)
+async def st_birth_date(message: Message, state: FSMContext, db: DB):
+    parsed = _parse_birth_date(message.text or "")
+    if parsed is None:
+        await message.answer(BIRTH_BAD)
+        return
+
+    profile = db.get_profile(message.from_user.id)
+    if not profile:
+        await state.clear()
+        await message.answer("Сначала заполни анкету: /start → Регистрация.")
+        return
+
+    profile.birth_date = parsed
+    profile.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db.save_profile(profile)
+    await state.clear()
+    await message.answer(BIRTH_SAVED.format(date=parsed))
+
+
 def _build_profile(telegram_id: int, data: dict) -> Profile:
     kind = data.get("contact_kind", "tg")
     nick = data.get("nickname", "")
@@ -152,4 +203,5 @@ def _build_profile(telegram_id: int, data: dict) -> Profile:
         nickname=("@" + nick) if kind == "tg" else f"vk: {nick}",
         consent_date=data.get("consent_at", ""),
         updated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        birth_date=data.get("birth_date", ""),
     )

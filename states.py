@@ -1,5 +1,5 @@
 # states.py
-# Состояния диалогов бота, версия 2.
+# Все FSM-состояния бота.
 
 from aiogram.fsm.state import State, StatesGroup
 
@@ -14,10 +14,10 @@ class SurveyStates(StatesGroup):
     nickname = State()
     confirm = State()
     edit_value = State()
+    birth_date = State()       # НОВОЕ: ввод даты рождения
 
 
 class AdminWorkshopStates(StatesGroup):
-    """Мастер создания мастерской."""
     title = State()
     format = State()
     description = State()
@@ -38,17 +38,20 @@ class AdminScheduleStates(StatesGroup):
 
 
 class AdminEditStates(StatesGroup):
-    """Редактирование мастерской: ждём новое значение поля."""
     value = State()
     photo = State()
 
 
 class AdminServiceStates(StatesGroup):
-    start_photo = State()
     format_photo = State()
+    start_photo = State()
     start_text = State()
 
 
 class AdminReminderStates(StatesGroup):
     audience = State()
+    text = State()
+
+
+class AdminBroadcastStates(StatesGroup):   # НОВОЕ: рассылка всем
     text = State()

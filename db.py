@@ -33,7 +33,7 @@ class DB:
                     telegram_id INTEGER PRIMARY KEY,
                     full_name TEXT, "group" TEXT, phone TEXT,
                     email TEXT, nickname TEXT,
-                    consent_date TEXT, updated_at TEXT
+                    consent_date TEXT, updated_at TEXT, birth_date TEXT
                 );
                 CREATE TABLE IF NOT EXISTS workshops (
                     id INTEGER PRIMARY KEY,
@@ -66,12 +66,15 @@ class DB:
 
     def _migrate(self):
         """Добавляет недостающие колонки в старые таблицы."""
-        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(workshops)").fetchall()}
+        wcols = {r[1] for r in self.conn.execute("PRAGMA table_info(workshops)").fetchall()}
+        pcols = {r[1] for r in self.conn.execute("PRAGMA table_info(profiles)").fetchall()}
         with self.lock, self.conn:
-            if "drive_folder_id" not in cols:
+            if "drive_folder_id" not in wcols:
                 self.conn.execute("ALTER TABLE workshops ADD COLUMN drive_folder_id TEXT")
-            if "participants_file_id" not in cols:
+            if "participants_file_id" not in wcols:
                 self.conn.execute("ALTER TABLE workshops ADD COLUMN participants_file_id TEXT")
+            if "birth_date" not in pcols:
+                self.conn.execute("ALTER TABLE profiles ADD COLUMN birth_date TEXT")
 
     # ==================================================
     # ПРОФИЛИ
@@ -85,18 +88,26 @@ class DB:
             return None
         return Profile(**{k: row[k] for k in row.keys()})
 
+    def get_all_profiles(self) -> List[Profile]:
+        """Все профили — для рассылки и отчёта уникальных людей."""
+        rows = self.conn.execute(
+            "SELECT * FROM profiles ORDER BY full_name"
+        ).fetchall()
+        return [Profile(**{k: row[k] for k in row.keys()}) for row in rows]
+
     def save_profile(self, p: Profile):
         with self.lock, self.conn:
             self.conn.execute(
-                """INSERT INTO profiles VALUES (?,?,?,?,?,?,?,?)
+                """INSERT INTO profiles VALUES (?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(telegram_id) DO UPDATE SET
                      full_name=excluded.full_name, "group"=excluded."group",
                      phone=excluded.phone, email=excluded.email,
                      nickname=excluded.nickname,
                      consent_date=excluded.consent_date,
-                     updated_at=excluded.updated_at""",
+                     updated_at=excluded.updated_at,
+                     birth_date=excluded.birth_date""",
                 (p.telegram_id, p.full_name, p.group, p.phone, p.email,
-                 p.nickname, p.consent_date, p.updated_at),
+                 p.nickname, p.consent_date, p.updated_at, p.birth_date),
             )
 
     # ==================================================
@@ -259,7 +270,7 @@ class DB:
                ORDER BY id DESC LIMIT 1""",
             (telegram_id, workshop_id, *ACTIVE),
         ).fetchone()
-        return self._row_to_records(row) if row else None
+        return self._row_to_record(row) if row else None
 
     def get_user_records(self, telegram_id: int) -> List[Record]:
         rows = self.conn.execute(
@@ -267,7 +278,7 @@ class DB:
                ORDER BY id""",
             (telegram_id, *ACTIVE),
         ).fetchall()
-        return [self._row_to_records(r) for r in rows]
+        return [self._row_to_record(r) for r in rows]
 
     def count_active(self, workshop_id: int, slot: int) -> int:
         row = self.conn.execute(
@@ -287,11 +298,11 @@ class DB:
             f"SELECT * FROM records WHERE workshop_id=? AND status IN ({q})",
             (workshop_id, *statuses),
         ).fetchall()
-        return [self._row_to_records(r) for r in rows]
+        return [self._row_to_record(r) for r in rows]
 
     def all_records(self) -> List[Record]:
         rows = self.conn.execute("SELECT * FROM records ORDER BY id").fetchall()
-        return [self._row_to_records(r) for r in rows]
+        return [self._row_to_record(r) for r in rows]
 
     def set_record_status(self, record_id: int, status: str):
         with self.lock, self.conn:
@@ -306,13 +317,13 @@ class DB:
                ORDER BY id LIMIT 1""",
             (workshop_id, slot),
         ).fetchone()
-        return self._row_to_records(row) if row else None
+        return self._row_to_record(row) if row else None
 
     def get_record(self, record_id: int) -> Optional[Record]:
         row = self.conn.execute(
             "SELECT * FROM records WHERE id=?", (record_id,)
         ).fetchone()
-        return self._row_to_records(row) if row else None
+        return self._row_to_record(row) if row else None
 
     def get_reserves(self, workshop_id: int, slot: int) -> List[Record]:
         rows = self.conn.execute(
@@ -321,10 +332,10 @@ class DB:
                ORDER BY id""",
             (workshop_id, slot),
         ).fetchall()
-        return [self._row_to_records(r) for r in rows]
+        return [self._row_to_record(r) for r in rows]
 
     @staticmethod
-    def _row_to_records(row) -> Record:
+    def _row_to_record(row) -> Record:
         return Record(
             id=row["id"], telegram_id=row["telegram_id"],
             username=row["username"], workshop_id=row["workshop_id"],
