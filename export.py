@@ -3,10 +3,12 @@
 #   1) файл «{название} — список участников» каждой мастерской;
 #   2) общий отчёт «Мастерские — зарегистрированные люди» (уникальные люди,
 #      с датой рождения). Таблица создаётся автоматически при первом цикле.
+# Между экспортами паузы по 2 секунды — не упираемся в квоту Google Sheets.
 
 from __future__ import annotations
 
 import asyncio
+import time
 
 import gspread
 
@@ -35,6 +37,9 @@ PEOPLE_HEADERS = [
     "Телефон", "Почта", "Контакт", "Дата регистрации", "Записей на МК",
 ]
 
+# Пауза между экспортами, чтобы не улетать в 429 Quota
+INTER_EXPORT_SLEEP_SEC = 5
+
 
 class ExportClient:
     def __init__(self, settings: Settings, db: DB):
@@ -46,13 +51,17 @@ class ExportClient:
         await asyncio.to_thread(self._sync_export)
 
     def _sync_export(self):
-        for w in self.db.get_workshops(include_deleted=False):
-            if not w.participants_file_id:
-                continue
+        workshops = [
+            w for w in self.db.get_workshops(include_deleted=False)
+            if w.participants_file_id
+        ]
+        for w in workshops:
             try:
                 self._export_workshop(w)
             except Exception as e:
                 print(f"[export] мастерская {w.id}: {e}")
+            time.sleep(INTER_EXPORT_SLEEP_SEC)
+
         try:
             self._export_people()
         except Exception as e:
@@ -83,7 +92,16 @@ class ExportClient:
                 STATUS_MAP.get(r.status, r.status),
                 r.created_at,
             ])
-        ws = self.gc.open_by_key(w.participants_file_id).worksheet("Участники")
+
+        spreadsheet = self.gc.open_by_key(w.participants_file_id)
+        try:
+            ws = spreadsheet.worksheet("Участники")
+        except Exception:
+            ws = spreadsheet.get_worksheet(0)
+            try:
+                ws.update_title("Участники")
+            except Exception:
+                pass
         ws.clear()
         width = len(PARTICIPANTS_HEADERS)
         ws.update(
@@ -135,7 +153,8 @@ class ExportClient:
                 count_by_user.get(p.telegram_id, 0),
             ])
 
-        ws = self.gc.open_by_key(sid).get_worksheet(0)
+        spreadsheet = self.gc.open_by_key(sid)
+        ws = spreadsheet.get_worksheet(0)
         try:
             ws.update_title("Люди")
         except Exception:
