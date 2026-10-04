@@ -61,6 +61,13 @@ class DB:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     workshop_id INTEGER, created_at TEXT, payload BLOB
                 );
+                CREATE TABLE IF NOT EXISTS workshop_dates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workshop_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                label TEXT DEFAULT '',
+                created_at TEXT DEFAULT ''
+                );
                 """
             )
 
@@ -75,7 +82,41 @@ class DB:
                 self.conn.execute("ALTER TABLE workshops ADD COLUMN participants_file_id TEXT")
             if "birth_date" not in pcols:
                 self.conn.execute("ALTER TABLE profiles ADD COLUMN birth_date TEXT")
-
+        # Миграция: переносим date1/date2 в workshop_dates
+        dcols = {r[1] for r in self.conn.execute("PRAGMA table_info(workshop_dates)").fetchall()}
+        if not dcols:
+            # Таблица только что создана — переносим старые даты
+            workshops = self.conn.execute("SELECT id, date1, date2 FROM workshops").fetchall()
+            for w in workshops:
+                if w["date1"]:
+                    self.conn.execute(
+                        "INSERT INTO workshop_dates (workshop_id, date, label) VALUES (?, ?, ?)",
+                        (w["id"], w["date1"], "Поток 1")
+                    )
+                if w["date2"]:
+                    self.conn.execute(
+                        "INSERT INTO workshop_dates (workshop_id, date, label) VALUES (?, ?, ?)",
+                        (w["id"], w["date2"], "Поток 2")
+                    )
+            print("[migrate] даты перенесены в workshop_dates")
+        # Миграция: обновляем slot в records на date_id
+        # slot=1 → date_id первой даты, slot=2 → date_id второй даты
+        try:
+            records = self.conn.execute("SELECT id, workshop_id, slot FROM records").fetchall()
+            for r in records:
+                dates = self.conn.execute(
+                    "SELECT id FROM workshop_dates WHERE workshop_id=? ORDER BY id",
+                    (r["workshop_id"],)
+                ).fetchall()
+                if dates and r["slot"] <= len(dates):
+                    new_date_id = dates[r["slot"] - 1]["id"]
+                    self.conn.execute(
+                        "UPDATE records SET slot=? WHERE id=?",
+                        (new_date_id, r["id"])
+                    )
+            print("[migrate] slot обновлён на date_id")
+        except Exception as e:
+            print(f"[migrate] ошибка миграции slot: {e}")
     # ==================================================
     # ПРОФИЛИ
     # ==================================================
@@ -398,3 +439,55 @@ class DB:
             (workshop_id,),
         ).fetchone()
         return row["c"] > 0
+
+    # ==================================================
+    # ДАТЫ МАСТЕРСКИХ (эпохи/потоки)
+    # ==================================================
+
+    def add_workshop_date(self, workshop_id: int, date: str, label: str = "") -> int:
+        """Добавляет новую дату (поток) к мастерской."""
+        with self.lock, self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO workshop_dates (workshop_id, date, label, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (workshop_id, date, label, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            return cur.lastrowid
+
+    def get_workshop_dates(self, workshop_id: int) -> list:
+        """Возвращает все даты мастерской."""
+        rows = self.conn.execute(
+            "SELECT * FROM workshop_dates WHERE workshop_id=? ORDER BY id",
+            (workshop_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_workshop_date(self, date_id: int) -> Optional[dict]:
+        """Возвращает одну дату по ID."""
+        row = self.conn.execute(
+            "SELECT * FROM workshop_dates WHERE id=?", (date_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def delete_workshop_date(self, date_id: int):
+        """Удаляет дату (поток) мастерской."""
+        with self.lock, self.conn:
+            self.conn.execute("DELETE FROM workshop_dates WHERE id=?", (date_id,))
+
+    def count_active_by_date(self, workshop_id: int, date_id: int) -> int:
+        """Количество активных записей на конкретную дату."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM records "
+            "WHERE workshop_id=? AND slot=? AND status='основной'",
+            (workshop_id, date_id),
+        ).fetchone()
+        return row["c"]
+
+    def count_active_by_date(self, workshop_id: int, date_id: int) -> int:
+        """Количество активных записей на конкретную дату."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM records "
+            "WHERE workshop_id=? AND slot=? AND status='основной'",
+            (workshop_id, date_id),
+        ).fetchone()
+        return row["c"]

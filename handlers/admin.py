@@ -681,6 +681,31 @@ async def st_edit_value(
                 db.update_workshop(ws_id, attendance_file_id=new_a_id)
             except Exception as e:
                 print(f"[admin] не удалось пересобрать посещаемость: {e}")
+
+    elif field == "add_date":
+        parsed = _parse_workshop_date(value)
+        if parsed is None:
+            await message.answer(ADMIN_BAD_DATE)
+            return
+
+        # Генерируем метку потока
+        existing_dates = db.get_workshop_dates(ws_id)
+        label = f"Поток {len(existing_dates) + 1}"
+
+        date_id = db.add_workshop_date(ws_id, parsed, label)
+
+        await state.clear()
+        w = db.get_workshop(ws_id)
+        await message.answer(
+            f"✅ Дата добавлена к мастерской «{w.title if w else ws_id}»:\n"
+            f"📅 {parsed} ({label})"
+        )
+        await message.answer(
+            EDIT_PICK.format(title=w.title if w else ws_id),
+            reply_markup=kb_admin_edit_fields(ws_id),
+        )
+        return
+
     else:
         db.update_workshop(ws_id, **{field: value})
 
@@ -1098,3 +1123,46 @@ async def cb_archive(
 
     await callback.message.answer(ARCHIVE_DONE.format(title=w.title))
     await callback.message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
+
+@router.callback_query(F.data.startswith("editf:add_date:"))
+async def cb_add_date(callback: CallbackQuery, state: FSMContext):
+    """Начало добавления новой даты к мастерской."""
+    await callback.answer()
+    ws_id = int(callback.data.split(":")[2])
+    await state.update_data(edit_ws=ws_id)
+    await state.set_state(AdminEditStates.value)
+    await state.update_data(edit_field="add_date")
+    await callback.message.answer(
+        "Введи новую дату в формате ДД.ММ.ГГГГ или ДД.ММ.ГГГГ ЧЧ:ММ:"
+    )
+
+
+@router.callback_query(F.data.startswith("ws:"))
+async def cb_workshop_card(callback: CallbackQuery, db: DB):
+    await callback.answer()
+    ws_id = int(callback.data.split(":")[1])
+    w = db.get_workshop(ws_id)
+    if not w or w.deleted:
+        await callback.message.answer("Мастерская не найдена.")
+        return
+
+    # Получаем все даты мастерской
+    dates = db.get_workshop_dates(ws_id)
+
+    # Формируем текст карточки
+    text = workshop_card_text(w, dates=dates, db=db)
+
+    sent = False
+    if w.photo:
+        try:
+            await callback.message.answer_photo(
+                w.photo, caption=text,
+                reply_markup=kb_workshop_card(ws_id), parse_mode="HTML",
+            )
+            sent = True
+        except Exception:
+            pass
+    if not sent:
+        await callback.message.answer(
+            text, reply_markup=kb_workshop_card(ws_id), parse_mode="HTML"
+        )

@@ -74,23 +74,26 @@ def my_record_line(title: str, status: str) -> str:
     label = "основной набор" if status == "основной" else status
     return f"{mark} {title} — {label}"
 
-def workshop_card_text(w, free1: int, free2: int | None = None) -> str:
-    """Карточка мастерской. free2 — для второй даты базовой."""
+def workshop_card_text(w, dates=None, db=None) -> str:
+    """Карточка мастерской с произвольным количеством дат."""
     lines = [f"🛠 <b>{w.title}</b>", ""]
     if w.description:
         lines += [w.description, ""]
-    if w.format == "базовая":
-        lines.append(f"📅 Дата первого занятия: {w.date1} — мест: {free1}")
-        if w.date2:
-            lines.append(f"📅 Дата второго занятия: {w.date2} — мест: {free2}")
+
+    if dates and db:
+        for d in dates:
+            count = db.count_active_by_date(w.id, d["id"])
+            free = max(w.quota - count, 0)
+            label = d.get("label", "")
+            lines.append(f"📅 {d['date']} ({label}) — мест: {free}")
     else:
+        # fallback для старых данных
         lines.append(f"📅 Дата первого занятия: {w.date1}")
-        lines.append(f"🔢 Занятий: {w.lessons_count}")
-        if w.days:
-            lines.append(f"🗓 Дни: {w.days}")
-        lines.append(f"🎟 Свободных мест: {free1}")
+        if w.date2:
+            lines.append(f"📅 Дата второго занятия: {w.date2}")
+
     lines.append(f"📍 Место: {w.location}")
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 def profile_confirm_text(p) -> str:
     return (

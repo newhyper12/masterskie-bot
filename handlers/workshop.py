@@ -204,12 +204,12 @@ async def cb_workshop_card(callback: CallbackQuery, db: DB):
         await callback.message.answer("Мастерская не найдена.")
         return
 
-    free1 = max(w.quota - db.count_active(ws_id, 1), 0)
-    free2 = None
-    if w.format == "базовая" and w.date2:
-        free2 = max(w.quota - db.count_active(ws_id, 2), 0)
+    # Получаем все даты мастерской
+    dates = db.get_workshop_dates(ws_id)
 
-    text = workshop_card_text(w, free1, free2)
+    # Формируем текст карточки
+    text = workshop_card_text(w, dates=dates, db=db)
+
     sent = False
     if w.photo:
         try:
@@ -256,7 +256,16 @@ async def cb_signup(
         await callback.message.answer("Сначала заполни анкету.", reply_markup=kb_start())
         return
 
-    # Базовая с двумя датами — сначала выбор даты (только одной!).
+    # НОВОЕ: Если у мастерской есть даты в таблице — показываем выбор даты
+    dates = db.get_workshop_dates(ws_id)
+    if dates:
+        await callback.message.answer(
+            "Выбери дату:",
+            reply_markup=kb_date_list(ws_id, dates),
+        )
+        return
+
+    # Старый вариант для совместимости (если даты ещё не мигрированы)
     if w.format == "базовая" and w.date2:
         await callback.message.answer(
             ASK_SLOT, reply_markup=kb_slot_dates(ws_id, w.date1, w.date2)
@@ -264,7 +273,6 @@ async def cb_signup(
         return
 
     await _signup_slot(callback.message, profile, w, 1, db, attendance)
-
 
 @router.callback_query(F.data.startswith("slot:"))
 async def cb_slot(
@@ -443,3 +451,52 @@ async def cb_cancel(
         await _offer_promotion(callback.bot, db, w, rec.slot)
 
     await show_my_records(callback.message, callback.from_user.id, db)
+
+
+@router.callback_query(F.data.startswith("datepick:"))
+async def cb_datepick(callback: CallbackQuery, db: DB, attendance: AttendanceClient):
+    await callback.answer()
+    _, date_id_raw, ws_raw = callback.data.split(":")
+    date_id = int(date_id_raw)
+    ws_id = int(ws_raw)
+
+    w = db.get_workshop(ws_id)
+    if not w or w.deleted:
+        return
+
+    existing = db.get_user_record(callback.from_user.id, ws_id)
+    if existing:
+        await callback.message.answer(
+            ALREADY_SIGNED_REAL.format(status=_status_label(existing.status))
+        )
+        return
+
+    profile = db.get_profile(callback.from_user.id)
+    if not profile:
+        await callback.message.answer("Сначала заполни анкету.", reply_markup=kb_start())
+        return
+
+    # Записываем на выбранную дату
+    await _signup_by_date(callback.message, profile, w, date_id, db, attendance)
+
+
+async def _signup_by_date(
+        message: Message,
+        profile: Profile,
+        w: Workshop,
+        date_id: int,
+        db: DB,
+        attendance: AttendanceClient,
+):
+    """Запись на конкретную дату по date_id."""
+    free = max(w.quota - db.count_active_by_date(w.id, date_id), 0)
+    if free <= 0:
+        await message.answer(
+            QUOTA_FULL.format(title=w.title), reply_markup=kb_reserve_by_date(w.id, date_id)
+        )
+        return
+
+    date_info = db.get_workshop_date(date_id)
+    date_str = date_info["date"] if date_info else ""
+
+    await _do_register(message, profile, w, date_id, "основной", db, attendance, date_str=date_str)

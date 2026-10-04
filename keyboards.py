@@ -214,12 +214,12 @@ def kb_admin_edit_fields(workshop_id: int) -> Markup:
         ("location", "Место"),
         ("quota", "Квота (мест)"),
         ("photo", "Фото"),
+        ("add_date", "📅 Добавить дату"),
     ]
     rows = [
         [KB(text=label, callback_data=f"editf:{key}:{workshop_id}")]
         for key, label in fields
     ]
-    # НОВОЕ: кнопка "Закрыть сейчас"
     rows.append([KB(text="🚪 Закрыть сейчас", callback_data=f"editf:close_now:{workshop_id}")])
     rows.append([KB(text="↩️ Назад", callback_data="admin:menu")])
     return Markup(inline_keyboard=rows)
@@ -274,3 +274,18 @@ def kb_confirm_archive(workshop_id: int) -> Markup:
         [KB(text="✅ Да, архивировать", callback_data=f"arch:yes:{workshop_id}")],
         [KB(text="❌ Нет", callback_data=f"arch:no:{workshop_id}")],
     ])
+
+def kb_add_date(workshop_id: int) -> Markup:
+    """Кнопка добавления новой даты в редактировании."""
+    return Markup(inline_keyboard=[
+        [KB(text="📅 Добавить дату", callback_data=f"editf:add_date:{workshop_id}")],
+    ])
+
+def kb_date_list(workshop_id: int, dates: list) -> Markup:
+    """Список дат для выбора при записи."""
+    rows = [
+        [KB(text=f"📅 {d['date']} ({d.get('label', '')})", callback_data=f"datepick:{d['id']}:{workshop_id}")]
+        for d in dates
+    ]
+    rows.append([KB(text="↩️ Назад", callback_data=f"ws:{workshop_id}")])
+    return Markup(inline_keyboard=rows)
