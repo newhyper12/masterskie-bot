@@ -156,7 +156,8 @@ def kb_admin_menu() -> Markup:
         [KB(text="✏️ Редактировать", callback_data="admin:edit")],
         [KB(text="🗑 Удалить", callback_data="admin:delete"),
          KB(text="♻️ Восстановить", callback_data="admin:restore")],
-        [KB(text=" Напоминания", callback_data="admin:remind")],
+        [KB(text="📦 Архивировать эпоху", callback_data="admin:archive")],
+        [KB(text="🔔 Напоминания", callback_data="admin:remind")],
         [KB(text="📨 Рассылка всем", callback_data="admin:broadcast")],
         [KB(text="🖼 Фото форматов", callback_data="admin:fmtphoto")],
         [KB(text="📸 Фото приветствия", callback_data="admin:setphoto"),
@@ -265,4 +266,11 @@ def kb_admin_slots(w) -> Markup:
         [KB(text=f"📅 {_short_date(w.date1)}", callback_data=f"remslot:1:{w.id}")],
         [KB(text=f"📅 {_short_date(w.date2)}", callback_data=f"remslot:2:{w.id}")],
         [KB(text="↩️ Назад", callback_data="admin:menu")],
+    ])
+
+def kb_confirm_archive(workshop_id: int) -> Markup:
+    """Подтверждение архивации эпохи."""
+    return Markup(inline_keyboard=[
+        [KB(text="✅ Да, архивировать", callback_data=f"arch:yes:{workshop_id}")],
+        [KB(text="❌ Нет", callback_data=f"arch:no:{workshop_id}")],
     ])

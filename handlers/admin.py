@@ -1028,3 +1028,73 @@ async def st_remind_text(message: Message, state: FSMContext, db: DB):
 
     await message.answer(REMINDER_SENT.format(sent=sent, total=len(targets)))
     await message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
+
+# ==================================================
+# АРХИВАЦИЯ ЭПОХ (перевыпуск мастерской)
+# ==================================================
+
+@router.callback_query(F.data == "admin:archive")
+async def cb_admin_archive(callback: CallbackQuery, db: DB, settings: Settings):
+    if not _is_admin(callback.from_user.id, settings):
+        return
+    await callback.answer()
+    workshops = db.get_workshops()
+    if not workshops:
+        await callback.message.answer("Нет активных мастерских.")
+        return
+    await callback.message.answer(
+        ARCHIVE_PICK,
+        reply_markup=kb_admin_workshops(workshops, "archws"),
+    )
+
+
+@router.callback_query(F.data.startswith("archws:"))
+async def cb_archws(callback: CallbackQuery, state: FSMContext, db: DB):
+    await callback.answer()
+    ws_id = int(callback.data.split(":")[1])
+    w = db.get_workshop(ws_id)
+    await state.set_state(AdminArchiveStates.confirm)
+    await state.update_data(archive_ws=ws_id)
+    await callback.message.answer(
+        ARCHIVE_CONFIRM.format(title=w.title if w else ws_id),
+        reply_markup=kb_confirm_archive(ws_id),
+    )
+
+
+@router.callback_query(F.data.startswith("arch:"), AdminArchiveStates.confirm)
+async def cb_archive(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db: DB,
+    attendance: AttendanceClient,
+    export: ExportClient,
+):
+    await callback.answer()
+    _, answer, ws_raw = callback.data.split(":")
+    ws_id = int(ws_raw)
+    await state.clear()
+
+    if answer == "no":
+        await callback.message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
+        return
+
+    w = db.get_workshop(ws_id)
+    if not w:
+        return
+
+    # Разделитель эпох в таблице участников
+    if w.participants_file_id:
+        try:
+            await attendance.add_archive_separator(w)
+        except Exception as e:
+            print(f"[admin] не удалось добавить разделитель: {e}")
+
+    # Немедленное обновление таблицы участников
+    if w.participants_file_id:
+        try:
+            await export.export_one(w)
+        except Exception as e:
+            print(f"[admin] не удалось обновить таблицу участников: {e}")
+
+    await callback.message.answer(ARCHIVE_DONE.format(title=w.title))
+    await callback.message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
