@@ -183,11 +183,17 @@ def kb_admin_open_now() -> Markup:
     ])
 
 
-def kb_admin_no_close() -> Markup:
+def kb_admin_no_close() -> Markup:    # ← ДОБАВЬ ЭТУ ФУНКЦИЮ
     return Markup(inline_keyboard=[
         [KB(text="Не закрывать", callback_data="noclose")],
     ])
 
+
+def kb_close_now() -> Markup:
+    """Кнопка для немедленного закрытия мастерской."""
+    return Markup(inline_keyboard=[
+        [KB(text="🚪 Закрыть сейчас", callback_data="editf:close_now:{ws_id}")],
+    ])
 
 def kb_admin_workshops(workshops, prefix: str) -> Markup:
     rows = [
@@ -212,9 +218,10 @@ def kb_admin_edit_fields(workshop_id: int) -> Markup:
         [KB(text=label, callback_data=f"editf:{key}:{workshop_id}")]
         for key, label in fields
     ]
+    # НОВОЕ: кнопка "Закрыть сейчас"
+    rows.append([KB(text="🚪 Закрыть сейчас", callback_data=f"editf:close_now:{workshop_id}")])
     rows.append([KB(text="↩️ Назад", callback_data="admin:menu")])
     return Markup(inline_keyboard=rows)
-
 
 def kb_confirm_delete(workshop_id: int) -> Markup:
     return Markup(inline_keyboard=[

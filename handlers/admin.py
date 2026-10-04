@@ -184,18 +184,15 @@ async def st_broadcast_text(message: Message, state: FSMContext, db: DB):
     await state.clear()
 
     profiles = db.get_all_profiles()
-    targets = [p.telegram_id for p in profiles]
     sent = 0
-    for i, tid in enumerate(targets):
+    for p in profiles:
         try:
-            await message.bot.send_message(tid, body, reply_markup=kb_birth_button())
+            await message.bot.send_message(p.telegram_id, body)  # ← БЕЗ reply_markup
             sent += 1
         except Exception:
             continue
-        if (i + 1) % BATCH_SIZE == 0 and i + 1 < len(targets):
-            await asyncio.sleep(BATCH_PAUSE_SEC)
 
-    await message.answer(BROADCAST_DONE.format(sent=sent, total=len(targets)))
+    await message.answer(BROADCAST_DONE.format(sent=sent, total=len(profiles)))
     await message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
 
 
@@ -592,6 +589,27 @@ async def cb_editf(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer(EDIT_ASK_VALUE.format(field=EDIT_LABELS[field]))
 
 
+# НОВОЕ: Обработчик кнопки "Закрыть сейчас"
+@router.callback_query(F.data.startswith("close_now:"))
+async def cb_close_now(callback: CallbackQuery, db: DB):
+    """Немедленно закрывает мастерскую."""
+    await callback.answer()
+    ws_id = int(callback.data.split(":")[1])
+
+    # Устанавливаем дату закрытия в текущее время
+    now_iso = datetime.now().strftime("%Y-%m-%d %H:%M")
+    db.update_workshop(ws_id, close_date=now_iso, is_open=False)
+
+    w = db.get_workshop(ws_id)
+    await callback.message.answer(
+        f"✅ Мастерская «{w.title if w else ws_id}» закрыта.\n"
+        f"Дата закрытия: {now_iso}"
+    )
+    await callback.message.answer(
+        EDIT_PICK.format(title=w.title if w else ws_id),
+        reply_markup=kb_admin_edit_fields(ws_id),
+    )
+
 @router.message(AdminEditStates.photo, F.photo)
 async def st_edit_photo(message: Message, state: FSMContext, db: DB):
     data = await state.get_data()
@@ -835,10 +853,6 @@ async def cb_archive(
         except Exception as e:
             print(f"[admin] не удалось добавить разделитель: {e}")
 
-    # Сброс активных записей
-    for r in db.get_workshop_records(ws_id, ["основной", "резерв"]):
-        db.set_record_status(r.id, "отменено")
-
     # Немедленное обновление таблицы участников
     if w.participants_file_id:
         try:
@@ -848,7 +862,6 @@ async def cb_archive(
 
     await callback.message.answer(ARCHIVE_DONE.format(title=w.title))
     await callback.message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
-
 
 # ==================================================
 # ФОТО ФОРМАТОВ / ПРИВЕТСТВИЕ

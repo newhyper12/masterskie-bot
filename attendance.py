@@ -486,6 +486,7 @@ class AttendanceClient:
 
     async def add_archive_separator(self, w: Workshop):
         """Добавляет разделитель в таблицу участников перед архивацией эпохи."""
+
         def _sync():
             if not w.participants_file_id:
                 return
@@ -501,14 +502,13 @@ class AttendanceClient:
 
             separator_rows = [
                 [""] * len(PARTICIPANTS_HEADERS),
-                [f"═══ АРХИВ {archive_date} ═══"] + [""] * (len(PARTICIPANTS_HEADERS) - 1),
+                [f"═══ НОВАЯ ЭПОХА {archive_date} ═══"] + [""] * (len(PARTICIPANTS_HEADERS) - 1),
                 [""] * len(PARTICIPANTS_HEADERS),
             ]
 
             ws.append_rows(separator_rows, value_input_option="USER_ENTERED")
 
-            # Жирный шрифт для строки-разделителя
-            start_row = last_row + 1  # индекс строки разделителя (с 0)
+            start_row = last_row + 1
             spreadsheet.batch_update({"requests": [{
                 "repeatCell": {
                     "range": {
