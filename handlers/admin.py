@@ -1,6 +1,6 @@
 # handlers/admin.py
-# Админ-панель v4: мастерские, расписание, редактирование с квотой,
-# удаление/восстановление, фото, напоминания + НОВОЕ: рассылка всем.
+# Админ-панель v5: мастерские, расписание, редактирование, удаление/восстановление,
+# напоминания по мастерской и дате, архивация эпох, рассылка всем.
 
 from __future__ import annotations
 
@@ -16,23 +16,25 @@ from aiogram.types import CallbackQuery, Message
 from attendance import AttendanceClient
 from config import Settings
 from db import DB
+from export import ExportClient
 from keyboards import (
-    kb_admin_audience,
     kb_admin_edit_fields,
     kb_admin_format,
     kb_admin_menu,
     kb_admin_no_close,
     kb_admin_open_now,
     kb_admin_skip,
+    kb_admin_slots,
     kb_admin_workshops,
     kb_birth_button,
+    kb_confirm_archive,
     kb_confirm_delete,
     kb_confirm_restore,
     kb_format_photo_pick,
 )
 from models import Workshop
-from scheduler import Scheduler
 from states import (
+    AdminArchiveStates,
     AdminBroadcastStates,
     AdminEditStates,
     AdminReminderStates,
@@ -61,6 +63,9 @@ from texts import (
     ADMIN_PHOTO_SET,
     ADMIN_SCHEDULE_SAVED,
     ADMIN_WORKSHOP_CREATED,
+    ARCHIVE_CONFIRM,
+    ARCHIVE_DONE,
+    ARCHIVE_PICK,
     BROADCAST_ASK_TEXT,
     BROADCAST_DONE,
     DELETE_CONFIRM,
@@ -91,6 +96,10 @@ EDIT_LABELS = {
     "quota": "квота",
 }
 
+# Пакетная отправка: 100 сообщений за 60 секунд (щадим сервер 2vCore/2GB)
+BATCH_SIZE = 100
+BATCH_PAUSE_SEC = 60
+
 
 def _is_admin(user_id: int, settings: Settings) -> bool:
     return user_id in settings.admin_ids
@@ -118,6 +127,20 @@ def _parse_workshop_date(value: str) -> str | None:
     return None
 
 
+async def _send_batch(bot, targets: list, body: str) -> int:
+    """Отправляет сообщение списку пользователей пакетами по BATCH_SIZE."""
+    sent = 0
+    for i, tid in enumerate(targets):
+        try:
+            await bot.send_message(tid, body)
+            sent += 1
+        except Exception:
+            continue
+        if (i + 1) % BATCH_SIZE == 0 and i + 1 < len(targets):
+            await asyncio.sleep(BATCH_PAUSE_SEC)
+    return sent
+
+
 # ==================================================
 # ВХОД
 # ==================================================
@@ -138,7 +161,7 @@ async def cb_admin_menu(callback: CallbackQuery, settings: Settings):
 
 
 # ==================================================
-# НОВОЕ: РАССЫЛКА ВСЕМ ЗАРЕГИСТРИРОВАННЫМ
+# РАССЫЛКА ВСЕМ
 # ==================================================
 
 @router.callback_query(F.data == "admin:broadcast")
@@ -161,17 +184,18 @@ async def st_broadcast_text(message: Message, state: FSMContext, db: DB):
     await state.clear()
 
     profiles = db.get_all_profiles()
+    targets = [p.telegram_id for p in profiles]
     sent = 0
-    for p in profiles:
+    for i, tid in enumerate(targets):
         try:
-            await message.bot.send_message(
-                p.telegram_id, body, reply_markup=kb_birth_button()
-            )
+            await message.bot.send_message(tid, body, reply_markup=kb_birth_button())
             sent += 1
         except Exception:
             continue
+        if (i + 1) % BATCH_SIZE == 0 and i + 1 < len(targets):
+            await asyncio.sleep(BATCH_PAUSE_SEC)
 
-    await message.answer(BROADCAST_DONE.format(sent=sent, total=len(profiles)))
+    await message.answer(BROADCAST_DONE.format(sent=sent, total=len(targets)))
     await message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
 
 
@@ -753,6 +777,80 @@ async def cb_restws(callback: CallbackQuery, db: DB, attendance: AttendanceClien
 
 
 # ==================================================
+# АРХИВАЦИЯ ЭПОХ (перевыпуск мастерской)
+# ==================================================
+
+@router.callback_query(F.data == "admin:archive")
+async def cb_admin_archive(callback: CallbackQuery, db: DB, settings: Settings):
+    if not _is_admin(callback.from_user.id, settings):
+        return
+    await callback.answer()
+    workshops = db.get_workshops()
+    if not workshops:
+        await callback.message.answer("Нет активных мастерских.")
+        return
+    await callback.message.answer(
+        ARCHIVE_PICK, reply_markup=kb_admin_workshops(workshops, "archws")
+    )
+
+
+@router.callback_query(F.data.startswith("archws:"))
+async def cb_archws(callback: CallbackQuery, state: FSMContext, db: DB):
+    await callback.answer()
+    ws_id = int(callback.data.split(":")[1])
+    w = db.get_workshop(ws_id)
+    await state.set_state(AdminArchiveStates.confirm)
+    await state.update_data(archive_ws=ws_id)
+    await callback.message.answer(
+        ARCHIVE_CONFIRM.format(title=w.title if w else ws_id),
+        reply_markup=kb_confirm_archive(ws_id),
+    )
+
+
+@router.callback_query(F.data.startswith("arch:"), AdminArchiveStates.confirm)
+async def cb_archive(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db: DB,
+    attendance: AttendanceClient,
+    export: ExportClient,
+):
+    await callback.answer()
+    _, answer, ws_raw = callback.data.split(":")
+    ws_id = int(ws_raw)
+    await state.clear()
+
+    if answer == "no":
+        await callback.message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
+        return
+
+    w = db.get_workshop(ws_id)
+    if not w:
+        return
+
+    # Разделитель эпох в таблице участников
+    if w.participants_file_id:
+        try:
+            await attendance.add_archive_separator(w)
+        except Exception as e:
+            print(f"[admin] не удалось добавить разделитель: {e}")
+
+    # Сброс активных записей
+    for r in db.get_workshop_records(ws_id, ["основной", "резерв"]):
+        db.set_record_status(r.id, "отменено")
+
+    # Немедленное обновление таблицы участников
+    if w.participants_file_id:
+        try:
+            await export.export_one(w)
+        except Exception as e:
+            print(f"[admin] не удалось обновить таблицу участников: {e}")
+
+    await callback.message.answer(ARCHIVE_DONE.format(title=w.title))
+    await callback.message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
+
+
+# ==================================================
 # ФОТО ФОРМАТОВ / ПРИВЕТСТВИЕ
 # ==================================================
 
@@ -822,7 +920,10 @@ async def cb_admin_settext(callback: CallbackQuery, state: FSMContext, settings:
 async def st_start_text(message: Message, state: FSMContext, db: DB):
     payload = {
         "text": message.text or message.caption or "",
-        "entities": [e.model_dump() for e in (message.entities or message.caption_entities or [])],
+        "entities": [
+            e.model_dump()
+            for e in (message.entities or message.caption_entities or [])
+        ],
     }
     db.kv_set("START_MESSAGE", json.dumps(payload, ensure_ascii=False))
     await state.clear()
@@ -831,22 +932,55 @@ async def st_start_text(message: Message, state: FSMContext, db: DB):
 
 
 # ==================================================
-# НАПОМИНАНИЯ
+# НАПОМИНАНИЯ ПО МАСТЕРСКОЙ И ДАТЕ
 # ==================================================
 
 @router.callback_query(F.data == "admin:remind")
-async def cb_admin_remind(callback: CallbackQuery, state: FSMContext, settings: Settings):
+async def cb_admin_remind(callback: CallbackQuery, db: DB, settings: Settings):
     if not _is_admin(callback.from_user.id, settings):
         return
     await callback.answer()
-    await state.set_state(AdminReminderStates.audience)
-    await callback.message.answer("Кому напомнить?", reply_markup=kb_admin_audience())
+    workshops = db.get_workshops()
+    if not workshops:
+        await callback.message.answer("Нет активных мастерских.")
+        return
+    await state_remind_pick(callback.message, db)
 
 
-@router.callback_query(F.data.startswith("aud:"), AdminReminderStates.audience)
-async def cb_aud(callback: CallbackQuery, state: FSMContext):
+async def state_remind_pick(message: Message, db: DB):
+    workshops = db.get_workshops()
+    await message.answer(
+        "Выбери мастерскую для напоминания:",
+        reply_markup=kb_admin_workshops(workshops, "remws"),
+    )
+
+
+@router.callback_query(F.data.startswith("remws:"))
+async def cb_remws(callback: CallbackQuery, state: FSMContext, db: DB):
     await callback.answer()
-    await state.update_data(aud=callback.data.split(":", 1)[1])
+    ws_id = int(callback.data.split(":")[1])
+    await state.update_data(remind_ws=ws_id)
+    w = db.get_workshop(ws_id)
+    if not w:
+        return
+
+    if w.format == "базовая" and w.date2:
+        await state.set_state(AdminReminderStates.slot)
+        await callback.message.answer(
+            f"На какую дату напоминать о «{w.title}»?",
+            reply_markup=kb_admin_slots(w),
+        )
+    else:
+        await state.update_data(remind_slot=1)
+        await state.set_state(AdminReminderStates.text)
+        await callback.message.answer(ADMIN_ASK_REMINDER_TEXT)
+
+
+@router.callback_query(F.data.startswith("remslot:"), AdminReminderStates.slot)
+async def cb_remslot(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    slot = int(callback.data.split(":")[1])
+    await state.update_data(remind_slot=slot)
     await state.set_state(AdminReminderStates.text)
     await callback.message.answer(ADMIN_ASK_REMINDER_TEXT)
 
@@ -854,28 +988,30 @@ async def cb_aud(callback: CallbackQuery, state: FSMContext):
 @router.message(AdminReminderStates.text)
 async def st_remind_text(message: Message, state: FSMContext, db: DB):
     data = await state.get_data()
-    aud = data.get("aud", "все")
+    ws_id = data.get("remind_ws")
+    slot = data.get("remind_slot", 1)
     body = (message.text or "").strip()
     await state.clear()
+
     if not body:
         await message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
         return
 
-    targets = set()
-    for w in db.get_workshops(include_deleted=True):
-        statuses = ["основной"] if aud == "основной" else (
-            ["резерв"] if aud == "резерв" else ["основной", "резерв"]
-        )
-        for r in db.get_workshop_records(w.id, statuses):
-            targets.add(r.telegram_id)
+    w = db.get_workshop(ws_id)
+    if not w:
+        await message.answer("Мастерская не найдена.")
+        await message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
+        return
 
-    sent = 0
-    for tid in targets:
-        try:
-            await message.bot.send_message(tid, reminder_text(body))
-            sent += 1
-        except Exception:
-            continue
+    records = db.get_workshop_records(ws_id, ["основной", "резерв"])
+    targets = [r.telegram_id for r in records if r.slot == slot]
+
+    if not targets:
+        await message.answer("На эту мастерскую и дату никто не записан.")
+        await message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())
+        return
+
+    sent = await _send_batch(message.bot, targets, reminder_text(body))
 
     await message.answer(REMINDER_SENT.format(sent=sent, total=len(targets)))
     await message.answer(ADMIN_MENU_TEXT, reply_markup=kb_admin_menu())

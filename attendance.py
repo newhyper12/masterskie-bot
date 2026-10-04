@@ -20,6 +20,7 @@ from google_drive import (
     share_with,
     user_drive,
 )
+from datetime import datetime
 from models import Workshop
 
 EXTRA_ROWS = 7  # запас строк под отменившихся
@@ -477,5 +478,55 @@ class AttendanceClient:
                         delete_file(drive, fid)
                     except Exception:
                         pass
+
+        await asyncio.to_thread(_sync)
+    # ==================================================
+    # НОВОЕ: РАЗДЕЛИТЕЛЬ АРХИВА (для перевыпуска мастерских)
+    # ==================================================
+
+    async def add_archive_separator(self, w: Workshop):
+        """Добавляет разделитель в таблицу участников перед архивацией эпохи."""
+        def _sync():
+            if not w.participants_file_id:
+                return
+            spreadsheet = self.gc.open_by_key(w.participants_file_id)
+            ws = spreadsheet.get_worksheet(0)
+
+            values = ws.get_all_values()
+            if not values:
+                return
+
+            last_row = len(values)
+            archive_date = datetime.now().strftime("%d.%m.%Y %H:%M")
+
+            separator_rows = [
+                [""] * len(PARTICIPANTS_HEADERS),
+                [f"═══ АРХИВ {archive_date} ═══"] + [""] * (len(PARTICIPANTS_HEADERS) - 1),
+                [""] * len(PARTICIPANTS_HEADERS),
+            ]
+
+            ws.append_rows(separator_rows, value_input_option="USER_ENTERED")
+
+            # Жирный шрифт для строки-разделителя
+            start_row = last_row + 1  # индекс строки разделителя (с 0)
+            spreadsheet.batch_update({"requests": [{
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": start_row,
+                        "endRowIndex": start_row + 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": len(PARTICIPANTS_HEADERS),
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "textFormat": {"bold": True}
+                        }
+                    },
+                    "fields": "userEnteredFormat.textFormat.bold"
+                }
+            }]})
+
+            print(f"[attendance] добавлен разделитель архива для мастерской {w.id}")
 
         await asyncio.to_thread(_sync)

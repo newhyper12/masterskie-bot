@@ -14,7 +14,7 @@ class SurveyStates(StatesGroup):
     nickname = State()
     confirm = State()
     edit_value = State()
-    birth_date = State()       # НОВОЕ: ввод даты рождения
+    birth_date = State()
 
 
 class AdminWorkshopStates(StatesGroup):
@@ -49,9 +49,15 @@ class AdminServiceStates(StatesGroup):
 
 
 class AdminReminderStates(StatesGroup):
+    workshop = State()
+    slot = State()
     audience = State()
     text = State()
 
 
-class AdminBroadcastStates(StatesGroup):   # НОВОЕ: рассылка всем
+class AdminBroadcastStates(StatesGroup):
     text = State()
+
+
+class AdminArchiveStates(StatesGroup):
+    confirm = State()

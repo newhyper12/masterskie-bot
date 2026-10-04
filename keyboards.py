@@ -244,3 +244,18 @@ def kb_admin_audience() -> Markup:
         [KB(text="✅ Основной список", callback_data="aud:основной")],
         [KB(text="🕑 Резерв", callback_data="aud:резерв")],
     ])
+def kb_confirm_archive(workshop_id: int) -> Markup:
+    """Подтверждение архивации эпохи."""
+    return Markup(inline_keyboard=[
+        [KB(text="✅ Да, архивировать", callback_data=f"arch:yes:{workshop_id}")],
+        [KB(text="❌ Нет", callback_data=f"arch:no:{workshop_id}")],
+    ])
+
+
+def kb_admin_slots(w) -> Markup:
+    """Выбор даты (slot) для напоминаний в базовой мастерской с двумя датами."""
+    return Markup(inline_keyboard=[
+        [KB(text=f"📅 {_short_date(w.date1)}", callback_data=f"remslot:1:{w.id}")],
+        [KB(text=f"📅 {_short_date(w.date2)}", callback_data=f"remslot:2:{w.id}")],
+        [KB(text="↩️ Назад", callback_data="admin:menu")],
+    ])

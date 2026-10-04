@@ -11,7 +11,7 @@ import asyncio
 import time
 
 import gspread
-
+from models import Workshop
 from attendance import PARTICIPANTS_HEADERS, col_letter
 from config import Settings
 from db import DB
@@ -49,6 +49,10 @@ class ExportClient:
 
     async def export_all(self):
         await asyncio.to_thread(self._sync_export)
+
+    async def export_one(self, w: Workshop):
+        """НОВОЕ: Экспорт одной мастерской (немедленное обновление после отмены/promote)."""
+        await asyncio.to_thread(self._export_workshop, w)
 
     def _sync_export(self):
         workshops = [

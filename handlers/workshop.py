@@ -8,7 +8,7 @@ from datetime import datetime
 
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, InputMediaPhoto, Message
-
+from export import ExportClient
 from attendance import AttendanceClient
 from db import DB
 from keyboards import (
@@ -60,7 +60,6 @@ def _slot_date(w: Workshop, slot: int) -> str:
 def _status_label(status: str) -> str:
     return {"основной": "основной набор", "резерв": "резерв"}.get(status, status)
 
-
 # ==================================================
 # ЭКРАНЫ
 # ==================================================
@@ -99,7 +98,6 @@ async def show_my_records(message: Message, user_id: int, db: DB):
         rows.append((r.workshop_id, title, r.status))
 
     await message.answer("\n".join(lines), reply_markup=kb_my_records(rows))
-
 
 # ==================================================
 # ЗАПИСЬ И РЕЗЕРВ
@@ -180,7 +178,6 @@ async def _offer_promotion(bot, db: DB, workshop: Workshop, slot: int):
             return
         except Exception:
             db.kv_set(key, "")
-
 
 # ==================================================
 # КАЛЛБЭКИ
@@ -337,21 +334,21 @@ async def cb_reserve(
         callback.message, profile, w, int(slot_raw), "резерв", db, attendance
     )
 
-
 # ==================================================
 # ПРЕДЛОЖЕНИЕ ПЕРЕВОДА ИЗ РЕЗЕРВА (Да / Нет, 1 час)
 # ==================================================
 
 @router.callback_query(F.data.startswith("promote:"))
+@router.callback_query(F.data.startswith("promote:"))
 async def cb_promote(
-    callback: CallbackQuery, db: DB, attendance: AttendanceClient
+    callback: CallbackQuery, db: DB, attendance: AttendanceClient, export: ExportClient
 ):
     await callback.answer()
     _, answer, rec_raw = callback.data.split(":")
     rec_id = int(rec_raw)
 
     rec = db.get_record(rec_id)
-    db.kv_set(f"offer:{rec_id}", "")
+    db.kv_set(f"offer:{rec.id}", "")
     if not rec:
         return
     w = db.get_workshop(rec.workshop_id)
@@ -383,18 +380,25 @@ async def cb_promote(
             except Exception as e:
                 print(f"[attendance] не удалось добавить поднятого: {e}")
 
+    # НОВОЕ: Немедленно обновляем файл участников после promote
+    if w.participants_file_id:
+        try:
+            await export.export_one(w)
+        except Exception as e:
+            print(f"[export] не удалось обновить файл участников после promote: {e}")
+
     await callback.message.answer(
         PROMOTE_YES.format(title=w.title, date=_slot_date(w, rec.slot))
     )
-
 
 # ==================================================
 # ОТМЕНА: освобождаем строку + предлагаем место
 # ==================================================
 
 @router.callback_query(F.data.startswith("cancel:"))
+@router.callback_query(F.data.startswith("cancel:"))
 async def cb_cancel(
-    callback: CallbackQuery, db: DB, attendance: AttendanceClient
+    callback: CallbackQuery, db: DB, attendance: AttendanceClient, export: ExportClient
 ):
     await callback.answer()
     _, action, ws_raw = callback.data.split(":")
@@ -427,6 +431,13 @@ async def cb_cancel(
                 )
             except Exception as e:
                 print(f"[attendance] не удалось освободить строку: {e}")
+
+        # НОВОЕ: Немедленно обновляем файл участников после отмены
+        if w.participants_file_id:
+            try:
+                await export.export_one(w)
+            except Exception as e:
+                print(f"[export] не удалось обновить файл участников после отмены: {e}")
 
         await callback.message.answer(CANCEL_DONE.format(title=w.title))
         await _offer_promotion(callback.bot, db, w, rec.slot)
