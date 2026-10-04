@@ -15,6 +15,7 @@ class SurveyStates(StatesGroup):
     confirm = State()
     edit_value = State()
     birth_date = State()
+    fullname_update = State()
 
 
 class AdminWorkshopStates(StatesGroup):
@@ -60,4 +61,13 @@ class AdminBroadcastStates(StatesGroup):
 
 
 class AdminArchiveStates(StatesGroup):
+    confirm = State()
+
+class AdminAskBirthStates(StatesGroup):
+    """Рассылка всем с просьбой указать дату рождения."""
+    confirm = State()
+
+
+class AdminAskFullNameStates(StatesGroup):
+    """Рассылка всем с просьбой указать полное ФИО."""
     confirm = State()

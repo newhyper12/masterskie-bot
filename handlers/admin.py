@@ -31,10 +31,13 @@ from keyboards import (
     kb_confirm_delete,
     kb_confirm_restore,
     kb_format_photo_pick,
+    kb_fullname_button,
 )
 from models import Workshop
 from states import (
     AdminArchiveStates,
+    AdminAskBirthStates,     # ← ПРАВИЛЬНО (с суффиксом States)
+    AdminAskFullNameStates,  # ← ПРАВИЛЬНО
     AdminBroadcastStates,
     AdminEditStates,
     AdminReminderStates,
@@ -83,6 +86,13 @@ from texts import (
     RESTORE_PICK,
     START_TEXT_SET,
     reminder_text,
+    ASK_BIRTH_BROADCAST,
+    ASK_BIRTH_BROADCAST_DONE,
+    ASK_FULLNAME_BROADCAST,
+    ASK_FULLNAME_BROADCAST_DONE,
+    ASK_UPDATE_FULLNAME,
+    FULLNAME_BAD,
+    FULLNAME_SAVED,
 )
 
 router = Router()
@@ -1166,3 +1176,170 @@ async def cb_workshop_card(callback: CallbackQuery, db: DB):
         await callback.message.answer(
             text, reply_markup=kb_workshop_card(ws_id), parse_mode="HTML"
         )
+
+# ==================================================
+# РАССЫЛКА: ПОПРОСИТЬ ДАТУ РОЖДЕНИЯ
+# ==================================================
+
+@router.callback_query(F.data == "admin:askbirth")
+async def cb_ask_birth(
+    callback: CallbackQuery, db: DB, settings: Settings
+):
+    if not _is_admin(callback.from_user.id, settings):
+        return
+    await callback.answer()
+
+    profiles = db.get_all_profiles()
+    # Фильтруем только тех, у кого нет даты рождения
+    targets = [p for p in profiles if not p.birth_date]
+
+    if not targets:
+        await callback.message.answer(
+            "✅ У всех зарегистрированных уже указана дата рождения."
+        )
+        await callback.message.answer(
+            ADMIN_MENU_TEXT, reply_markup=kb_admin_menu()
+        )
+        return
+
+    await callback.message.answer(
+        f"📤 Отправить просьбу указать дату рождения "
+        f"{len(targets)} пользователям?\n\n"
+        f"Сообщение:\n{ASK_BIRTH_BROADCAST}",
+        reply_markup=kb_confirm_broadcast_birth(len(targets)),
+    )
+
+
+def kb_confirm_broadcast_birth(count: int) -> Markup:
+    return Markup(inline_keyboard=[
+        [KB(text=f"✅ Отправить ({count})", callback_data="askbirth:yes")],
+        [KB(text="❌ Отмена", callback_data="askbirth:no")],
+    ])
+
+
+@router.callback_query(F.data.startswith("askbirth:"))
+async def cb_confirm_birth(callback: CallbackQuery, db: DB):
+    await callback.answer()
+    _, answer = callback.data.split(":")
+
+    if answer == "no":
+        await callback.message.answer(
+            ADMIN_MENU_TEXT, reply_markup=kb_admin_menu()
+        )
+        return
+
+    profiles = db.get_all_profiles()
+    targets = [p for p in profiles if not p.birth_date]
+
+    sent = 0
+    for i, p in enumerate(targets):
+        try:
+            await callback.bot.send_message(
+                p.telegram_id,
+                ASK_BIRTH_BROADCAST,
+                reply_markup=kb_birth_button(),
+            )
+            sent += 1
+        except Exception:
+            continue
+        if (i + 1) % BATCH_SIZE == 0 and i + 1 < len(targets):
+            await asyncio.sleep(BATCH_PAUSE_SEC)
+
+    await callback.message.answer(
+        ASK_BIRTH_BROADCAST_DONE.format(sent=sent, total=len(targets))
+    )
+    await callback.message.answer(
+        ADMIN_MENU_TEXT, reply_markup=kb_admin_menu()
+    )
+
+
+# ==================================================
+# РАССЫЛКА: ПОПРОСИТЬ ПОЛНОЕ ФИО
+# ==================================================
+
+@router.callback_query(F.data == "admin:askfullname")
+async def cb_ask_fullname(
+    callback: CallbackQuery, db: DB, settings: Settings
+):
+    if not _is_admin(callback.from_user.id, settings):
+        return
+    await callback.answer()
+
+    profiles = db.get_all_profiles()
+    # Фильтруем тех, у кого ФИО не полное (меньше 3 слов)
+    targets = [
+        p for p in profiles
+        if not p.full_name or len(p.full_name.split()) < 3
+    ]
+
+    if not targets:
+        await callback.message.answer(
+            "✅ У всех зарегистрированных уже указано полное ФИО."
+        )
+        await callback.message.answer(
+            ADMIN_MENU_TEXT, reply_markup=kb_admin_menu()
+        )
+        return
+
+    await callback.message.answer(
+        f"📤 Отправить просьбу указать полное ФИО "
+        f"{len(targets)} пользователям?\n\n"
+        f"Сообщение:\n{ASK_FULLNAME_BROADCAST}",
+        reply_markup=kb_confirm_broadcast_fullname(len(targets)),
+    )
+
+
+def kb_confirm_broadcast_fullname(count: int) -> Markup:
+    return Markup(inline_keyboard=[
+        [KB(text=f"✅ Отправить ({count})", callback_data="askfullname:yes")],
+        [KB(text="❌ Отмена", callback_data="askfullname:no")],
+    ])
+
+
+@router.callback_query(F.data.startswith("askfullname:"))
+async def cb_confirm_fullname(callback: CallbackQuery, db: DB):
+    await callback.answer()
+    _, answer = callback.data.split(":")
+
+    if answer == "no":
+        await callback.message.answer(
+            ADMIN_MENU_TEXT, reply_markup=kb_admin_menu()
+        )
+        return
+
+    profiles = db.get_all_profiles()
+    targets = [
+        p for p in profiles
+        if not p.full_name or len(p.full_name.split()) < 3
+    ]
+
+    sent = 0
+    for i, p in enumerate(targets):
+        try:
+            await callback.bot.send_message(
+                p.telegram_id,
+                ASK_FULLNAME_BROADCAST,
+                reply_markup=kb_fullname_button(),
+            )
+            sent += 1
+        except Exception:
+            continue
+        if (i + 1) % BATCH_SIZE == 0 and i + 1 < len(targets):
+            await asyncio.sleep(BATCH_PAUSE_SEC)
+
+    await callback.message.answer(
+        ASK_FULLNAME_BROADCAST_DONE.format(sent=sent, total=len(targets))
+    )
+    await callback.message.answer(
+        ADMIN_MENU_TEXT, reply_markup=kb_admin_menu()
+    )
+
+# ==================================================
+# СБОР ПОЛНОГО ФИО (кнопка из рассылки)
+# ==================================================
+
+@router.callback_query(F.data == "fullname:set")
+async def cb_fullname_set(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(SurveyStates.fullname_update)
+    await callback.message.answer(ASK_UPDATE_FULLNAME)

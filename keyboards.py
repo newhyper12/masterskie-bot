@@ -159,6 +159,8 @@ def kb_admin_menu() -> Markup:
         [KB(text="📦 Архивировать эпоху", callback_data="admin:archive")],
         [KB(text="🔔 Напоминания", callback_data="admin:remind")],
         [KB(text="📨 Рассылка всем", callback_data="admin:broadcast")],
+        [KB(text="🎂 Попросить дату рождения", callback_data="admin:askbirth")],
+        [KB(text="✍️ Попросить полное ФИО", callback_data="admin:askfullname")],
         [KB(text="🖼 Фото форматов", callback_data="admin:fmtphoto")],
         [KB(text="📸 Фото приветствия", callback_data="admin:setphoto"),
          KB(text="✍️ Текст приветствия", callback_data="admin:settext")],
@@ -289,3 +291,9 @@ def kb_date_list(workshop_id: int, dates: list) -> Markup:
     ]
     rows.append([KB(text="↩️ Назад", callback_data=f"ws:{workshop_id}")])
     return Markup(inline_keyboard=rows)
+
+def kb_fullname_button() -> Markup:
+    """Кнопка обновления полного ФИО — крепится к рассылке."""
+    return Markup(inline_keyboard=[
+        [KB(text="✍️ Указать полное ФИО", callback_data="fullname:set")],
+    ])

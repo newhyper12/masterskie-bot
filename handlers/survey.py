@@ -29,6 +29,9 @@ from texts import (
     BIRTH_SAVED,
     EDIT_ASK_VALUE,
     profile_confirm_text,
+    ASK_UPDATE_FULLNAME,
+    FULLNAME_BAD,
+    FULLNAME_SAVED,
 )
 from handlers.start import route_after
 
@@ -205,3 +208,22 @@ def _build_profile(telegram_id: int, data: dict) -> Profile:
         updated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         birth_date=data.get("birth_date", ""),
     )
+
+@router.message(SurveyStates.fullname_update)
+async def st_fullname_update(message: Message, state: FSMContext, db: DB):
+    value = (message.text or "").strip()
+    if len(value.split()) < 3:
+        await message.answer(FULLNAME_BAD)
+        return
+
+    profile = db.get_profile(message.from_user.id)
+    if not profile:
+        await state.clear()
+        await message.answer("Сначала заполни анкету: /start → Регистрация.")
+        return
+
+    profile.full_name = value
+    profile.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db.save_profile(profile)
+    await state.clear()
+    await message.answer(FULLNAME_SAVED.format(fullname=value))
