@@ -30,8 +30,8 @@ async def main():
     )
     dp = Dispatcher()
 
-    dp.include_router(start.router)
     dp.include_router(survey.router)
+    dp.include_router(start.router)
     dp.include_router(workshop.router)
     dp.include_router(admin.router)
 
