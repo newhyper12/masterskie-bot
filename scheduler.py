@@ -52,22 +52,38 @@ class Scheduler:
         now = datetime.now()
         for w in self.db.get_workshops_raw(include_deleted=False):
             new_open = w.is_open
+
+            # Проверка открытия
             if not new_open and w.open_date:
                 try:
-                    if datetime.fromisoformat(w.open_date) <= now:
-                        new_open = True
+                    open_dt = datetime.fromisoformat(w.open_date)
                 except ValueError:
-                    pass
+                    try:
+                        open_dt = datetime.strptime(w.open_date, "%Y-%m-%d %H:%M")
+                    except ValueError:
+                        open_dt = None
+
+                if open_dt and open_dt <= now:
+                    new_open = True
+
+            # Проверка закрытия
             if new_open and w.close_date:
                 try:
-                    if datetime.fromisoformat(w.close_date) <= now:
-                        new_open = False
+                    close_dt = datetime.fromisoformat(w.close_date)
                 except ValueError:
-                    pass
+                    try:
+                        close_dt = datetime.strptime(w.close_date, "%Y-%m-%d %H:%M")
+                    except ValueError:
+                        close_dt = None
+
+                if close_dt and close_dt <= now:
+                    new_open = False
+
             if new_open != w.is_open:
                 self.db.update_workshop(w.id, is_open=new_open)
+                status = "открыта" if new_open else "закрыта"
+                print(f"[scheduler] мастерская {w.id} «{w.title}» {status}")
 
-    # ---------- резервные копии ----------
 
     async def backup_one(self, workshop_id: int):
         w = self.db.get_workshop(workshop_id)

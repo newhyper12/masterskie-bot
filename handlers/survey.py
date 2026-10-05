@@ -32,6 +32,12 @@ from texts import (
     ASK_UPDATE_FULLNAME,
     FULLNAME_BAD,
     FULLNAME_SAVED,
+    ASK_BIRTH_DATE,
+    BIRTH_BAD,
+    BIRTH_SAVED,
+    ASK_UPDATE_FULLNAME,
+    FULLNAME_BAD,
+    FULLNAME_SAVED,
 )
 from handlers.start import route_after
 
@@ -44,18 +50,6 @@ FIELD_LABELS = {
     "email": "почта",
     "nickname": "контакт",
 }
-
-
-def _parse_birth_date(value: str) -> str | None:
-    """Принимает ДД.ММ.ГГГГ (или ДД.ММ.ГГ), возвращает ДД.ММ.ГГГГ или None."""
-    value = (value or "").strip()
-    for fmt in ("%d.%m.%Y", "%d.%m.%y"):
-        try:
-            dt = datetime.strptime(value, fmt)
-            return dt.strftime("%d.%m.%Y")
-        except ValueError:
-            continue
-    return None
 
 
 @router.callback_query(F.data == "consent:yes", SurveyStates.consent)
@@ -227,3 +221,112 @@ async def st_fullname_update(message: Message, state: FSMContext, db: DB):
     db.save_profile(profile)
     await state.clear()
     await message.answer(FULLNAME_SAVED.format(fullname=value))
+
+
+# ==================================================
+# МОИ ДАННЫЕ (просмотр и редактирование)
+# ==================================================
+
+@router.message(F.text == "👤 Мои данные")
+async def cmd_my_data(message: Message, db: DB):
+    """Показывает профиль пользователя с кнопками редактирования."""
+    profile = db.get_profile(message.from_user.id)
+    if not profile:
+        await message.answer(
+            "Вы ещё не зарегистрированы. Нажмите «📝 Регистрация на МК».",
+            reply_markup=kb_main_reply(),
+        )
+        return
+
+    birth = profile.birth_date or "не указана"
+    text = (
+        f"👤 <b>Ваши данные:</b>\n\n"
+        f"ФИО: {profile.full_name or '—'}\n"
+        f"Группа: {profile.group or '—'}\n"
+        f"Телефон: {profile.phone or '—'}\n"
+        f"Почта: {profile.email or '—'}\n"
+        f"Контакт: {profile.nickname or '—'}\n"
+        f"Дата рождения: {birth}\n\n"
+        f"Что хотите изменить?"
+    )
+    await message.answer(text, reply_markup=kb_edit_profile(), parse_mode="HTML")
+
+
+@router.callback_query(F.data == "edit:birth_date")
+async def cb_edit_birth(callback: CallbackQuery, state: FSMContext):
+    """Начало редактирования даты рождения."""
+    await callback.answer()
+    await state.set_state(SurveyStates.birth_date)
+    await callback.message.answer(
+        "Введите дату рождения в формате ДД.ММ.ГГГГ (например, 05.03.2007):\n\n"
+        "Или отправьте «Отмена» чтобы выйти."
+    )
+
+
+@router.message(SurveyStates.birth_date)
+async def st_birth_date_update(message: Message, state: FSMContext, db: DB):
+    """Обновление даты рождения из профиля."""
+    value = (message.text or "").strip()
+
+    if value.lower() in ("отмена", "cancel"):
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=kb_main_reply())
+        return
+
+    parsed = _parse_birth_date(value)
+    if parsed is None:
+        await message.answer(BIRTH_BAD)
+        return
+
+    profile = db.get_profile(message.from_user.id)
+    if not profile:
+        await state.clear()
+        return
+
+    profile.birth_date = parsed
+    profile.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db.save_profile(profile)
+    await state.clear()
+    await message.answer(BIRTH_SAVED.format(date=parsed), reply_markup=kb_main_reply())
+
+
+def _parse_birth_date(value: str) -> str | None:
+    """Парсит дату рождения."""
+    value = (value or "").strip()
+    for fmt in ("%d.%m.%Y", "%d.%m.%y"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            age = (datetime.now() - dt).days / 365.25
+            if age < 5 or age > 100:
+                return None
+            return dt.strftime("%d.%m.%Y")
+        except ValueError:
+            continue
+    return None
+
+
+@router.callback_query(F.data == "edit:full_name")
+async def cb_edit_fullname(callback: CallbackQuery, state: FSMContext):
+    """Начало редактирования полного ФИО."""
+    await callback.answer()
+    await state.set_state(SurveyStates.fullname_update)
+    await callback.message.answer(ASK_UPDATE_FULLNAME)
+
+
+@router.message(SurveyStates.fullname_update)
+async def st_fullname_update(message: Message, state: FSMContext, db: DB):
+    value = (message.text or "").strip()
+    if len(value.split()) < 3:
+        await message.answer(FULLNAME_BAD)
+        return
+
+    profile = db.get_profile(message.from_user.id)
+    if not profile:
+        await state.clear()
+        return
+
+    profile.full_name = value
+    profile.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db.save_profile(profile)
+    await state.clear()
+    await message.answer(FULLNAME_SAVED.format(fullname=value), reply_markup=kb_main_reply())

@@ -53,14 +53,11 @@ async def _send_start(obj: Message, db: DB):
     if sent is None:
         sent = await obj.answer(text, entities=ents, reply_markup=kb_start())
 
-    # 2) Нижняя клавиатура «🏠 Меню»: ставим её служебным сообщением
-    #    и сразу удаляем его. Сообщений «Меню» пользователь не видит.
+    # 2) Нижняя клавиатура «🏠 Меню»: отправляем с реальным текстом
     try:
-        anchor = await obj.answer("\u200b", reply_markup=kb_main_reply())
-        await anchor.delete()
+        await obj.answer("🏠 Главное меню", reply_markup=kb_main_reply())
     except Exception as e:
         print(f"[start] не удалось поставить нижнюю клавиатуру: {e}")
-
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, db: DB):

@@ -32,11 +32,11 @@ def kb_main_reply() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="📝 Регистрация на МК"),
              KeyboardButton(text="📋 Мои записи")],
-            [KeyboardButton(text="🏠 Меню")],
+            [KeyboardButton(text="👤 Мои данные"),
+             KeyboardButton(text="🏠 Меню")],
         ],
         resize_keyboard=True,
     )
-
 
 def kb_start() -> Markup:
     return Markup(inline_keyboard=[
@@ -296,4 +296,16 @@ def kb_fullname_button() -> Markup:
     """Кнопка обновления полного ФИО — крепится к рассылке."""
     return Markup(inline_keyboard=[
         [KB(text="✍️ Указать полное ФИО", callback_data="fullname:set")],
+    ])
+
+def kb_edit_profile() -> Markup:
+    """Клавиатура редактирования профиля."""
+    return Markup(inline_keyboard=[
+        [KB(text="ФИО", callback_data="edit:full_name"),
+         KB(text="Группа", callback_data="edit:group")],
+        [KB(text="Телефон", callback_data="edit:phone"),
+         KB(text="Почта", callback_data="edit:email")],
+        [KB(text="Контакт", callback_data="edit:nickname")],
+        [KB(text="🎂 Дата рождения", callback_data="edit:birth_date")],
+        [KB(text="↩️ В меню", callback_data="back:menu")],
     ])
