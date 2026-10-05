@@ -74,23 +74,34 @@ def my_record_line(title: str, status: str) -> str:
     label = "основной набор" if status == "основной" else status
     return f"{mark} {title} — {label}"
 
-def workshop_card_text(w, dates=None, db=None) -> str:
-    """Карточка мастерской с произвольным количеством дат."""
+
+def workshop_card_text(w, free1: int = 0, free2: int | None = None, dates: list = None, db=None) -> str:
+    """Карточка мастерской. free2 — для второй даты базовой. dates — для новой архитектуры."""
     lines = [f"🛠 <b>{w.title}</b>", ""]
     if w.description:
         lines += [w.description, ""]
 
+    # Новая архитектура: несколько дат
     if dates and db:
         for d in dates:
-            count = db.count_active_by_date(w.id, d["id"])
+            date_id = d['id']
+            date_text = d['date']
+            label = d.get('label', '')
+            count = db.count_active_by_date(w.id, date_id)
             free = max(w.quota - count, 0)
-            label = d.get("label", "")
-            lines.append(f"📅 {d['date']} ({label}) — мест: {free}")
-    else:
-        # fallback для старых данных
-        lines.append(f"📅 Дата первого занятия: {w.date1}")
+            lines.append(f"📅 {date_text} ({label}) — мест: {free}")
+
+    # Старая архитектура: date1/date2 (для совместимости)
+    elif w.format == "базовая":
+        lines.append(f"📅 Дата первого занятия: {w.date1} — мест: {free1}")
         if w.date2:
-            lines.append(f"📅 Дата второго занятия: {w.date2}")
+            lines.append(f"📅 Дата второго занятия: {w.date2} — мест: {free2}")
+    else:
+        lines.append(f"📅 Дата первого занятия: {w.date1}")
+        lines.append(f"🔢 Занятий: {w.lessons_count}")
+        if w.days:
+            lines.append(f"🗓 Дни: {w.days}")
+        lines.append(f"🎟 Свободных мест: {free1}")
 
     lines.append(f"📍 Место: {w.location}")
     return "\n".join(lines)
