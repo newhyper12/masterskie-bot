@@ -482,12 +482,3 @@ class DB:
             (workshop_id, date_id),
         ).fetchone()
         return row["c"]
-
-    def count_active_by_date(self, workshop_id: int, date_id: int) -> int:
-        """Количество активных записей на конкретную дату."""
-        row = self.conn.execute(
-            "SELECT COUNT(*) AS c FROM records "
-            "WHERE workshop_id=? AND slot=? AND status='основной'",
-            (workshop_id, date_id),
-        ).fetchone()
-        return row["c"]

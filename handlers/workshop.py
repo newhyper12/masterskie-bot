@@ -53,9 +53,11 @@ PROMOTE_TTL_SEC = 3600  # предложение резервисту живёт
 
 def _slot_date(w: Workshop, slot: int) -> str:
     if w.format == "базовая":
-        return w.date1 if slot == 1 else (w.date2 or w.date1)
-    return w.date1
-
+        if slot == 1:
+            return w.date1 if w.date1 else "Дата уточняется"
+        else:
+            return w.date2 if w.date2 else "Дата уточняется"
+    return w.date1 if w.date1 else "Дата уточняется"
 
 def _status_label(status: str) -> str:
     return {"основной": "основной набор", "резерв": "резерв"}.get(status, status)

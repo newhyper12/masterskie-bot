@@ -85,7 +85,7 @@ def workshop_card_text(w, free1: int = 0, free2: int | None = None, dates: list 
     if dates and db:
         for d in dates:
             date_id = d['id']
-            date_text = d['date']
+            date_text = d['date'] or "Дата уточняется"
             label = d.get('label', '')
             count = db.count_active_by_date(w.id, date_id)
             free = max(w.quota - count, 0)
@@ -93,10 +93,24 @@ def workshop_card_text(w, free1: int = 0, free2: int | None = None, dates: list 
 
     # Старая архитектура: date1/date2 (для совместимости)
     elif w.format == "базовая":
+        # Если free1 не передан, считаем из БД
+        if free1 == 0 and db:
+            count = db.count_active(w.id, 1)
+            free1 = max(w.quota - count, 0)
+
         lines.append(f"📅 Дата первого занятия: {w.date1} — мест: {free1}")
         if w.date2:
+            # Если free2 не передан, считаем из БД
+            if free2 is None and db:
+                count = db.count_active(w.id, 2)
+                free2 = max(w.quota - count, 0)
             lines.append(f"📅 Дата второго занятия: {w.date2} — мест: {free2}")
     else:
+        # Специальная мастерская
+        if free1 == 0 and db:
+            count = db.count_active(w.id, 1)
+            free1 = max(w.quota - count, 0)
+
         lines.append(f"📅 Дата первого занятия: {w.date1}")
         lines.append(f"🔢 Занятий: {w.lessons_count}")
         if w.days:
